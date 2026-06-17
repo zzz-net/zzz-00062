@@ -132,7 +132,7 @@ def import_batch(
     _=Depends(auth.require_role(auth.ALLOW_IMPORT_ROLES))
 ):
     try:
-        result = crud.import_batch(db, batch_data)
+        result, cleared_candidate, change_log = crud.import_batch(db, batch_data)
         crud.write_audit_log(
             db,
             action="import_batch",
@@ -142,6 +142,16 @@ def import_batch(
             result="success",
             detail=f"导入批次: {batch_data.batch_name}, 供应商数: {len(batch_data.suppliers)}",
         )
+        if cleared_candidate and change_log:
+            crud.write_audit_log(
+                db,
+                action="candidate_cleared_on_import",
+                operator=batch_data.imported_by,
+                target_type="candidate",
+                target_id=str(cleared_candidate.id),
+                result="cleared",
+                detail=change_log.change_reason,
+            )
         return result
     except ValueError as e:
         crud.write_audit_log(

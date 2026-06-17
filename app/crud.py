@@ -67,9 +67,23 @@ def import_batch(db: Session, batch_data: schemas.BatchImportRequest):
         )
         db.add(db_supplier)
 
+    cleared_candidate = None
+    change_log = None
+    current_candidate = get_current_candidate(db)
+    if current_candidate and current_candidate.rule_id == batch_data.rule_id:
+        current_candidate.is_current = False
+        cleared_candidate = current_candidate
+        change_log = models.CandidateChangeLog(
+            old_candidate_id=current_candidate.id,
+            new_candidate_id=None,
+            change_reason=f"导入同规则(rule_id={batch_data.rule_id})新批次{db_batch.id}，旧候选批次{current_candidate.batch_id}自动失效",
+            operated_by=batch_data.imported_by,
+        )
+        db.add(change_log)
+
     db.commit()
     db.refresh(db_batch)
-    return db_batch
+    return db_batch, cleared_candidate, change_log
 
 
 def get_batch(db: Session, batch_id: int):

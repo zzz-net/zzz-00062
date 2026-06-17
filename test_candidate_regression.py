@@ -57,12 +57,16 @@ def main():
 
     section("1. 基本候选设置与查询")
 
-    step("1.1", "获取规则并导入计算批次A")
+    step("1.1", "获取规则并预先导入计算所有需要的批次（避免候选设置后导入触发清空）")
     resp = requests.get(f"{BASE_URL}/api/rules", headers=admin_h)
     rule_id = resp.json()[0]["id"]
 
     batch_a_id, _ = import_and_calculate("候选回归-批次A", rule_id, "CND-001", "候选供应商A", admin_h)
     check("批次A导入计算成功", batch_a_id is not None)
+    batch_b_id, _ = import_and_calculate("候选回归-批次B", rule_id, "CND-002", "候选供应商B", approver_h)
+    check("批次B导入计算成功", batch_b_id is not None)
+    batch_c_id, _ = import_and_calculate("候选回归-批次C", rule_id, "CND-003", "候选供应商C", admin_h)
+    check("批次C导入计算成功", batch_c_id is not None)
 
     step("1.2", "设置批次A为候选发布")
     candidate_req = {
@@ -120,11 +124,7 @@ def main():
 
     section("2. 候选切换(顶替)与审计")
 
-    step("2.1", "导入计算批次B")
-    batch_b_id, _ = import_and_calculate("候选回归-批次B", rule_id, "CND-002", "候选供应商B", approver_h)
-    check("批次B导入计算成功", batch_b_id is not None)
-
-    step("2.2", "设置批次B为候选(应顶替批次A)")
+    step("2.1", "设置批次B为候选(应顶替批次A)")
     candidate_req_b = {
         "batch_id": batch_b_id,
         "change_description": "批次B的变更说明-顶替A",
@@ -143,14 +143,14 @@ def main():
         check("变更日志new_candidate_id非空", new_change_log["new_candidate_id"] is not None)
         check("变更日志change_reason包含'顶替'", "顶替" in new_change_log["change_reason"])
 
-    step("2.3", "验证当前候选已切换到批次B")
+    step("2.2", "验证当前候选已切换到批次B")
     resp = requests.get(f"{BASE_URL}/api/candidate/current", headers=admin_h)
     check("当前候选返回200", resp.status_code == 200)
     if resp.status_code == 200:
         current = resp.json()
         check("当前候选batch_id=批次B", current["batch_id"] == batch_b_id)
 
-    step("2.4", "验证candidate_replaced审计记录")
+    step("2.3", "验证candidate_replaced审计记录")
     resp = requests.get(f"{BASE_URL}/api/audit-logs?action=candidate_replaced", headers=admin_h)
     logs = resp.json()
     replaced_logs = [l for l in logs if l["result"] == "replaced"]
@@ -162,7 +162,7 @@ def main():
         check("detail包含旧候选ID", str(candidate_a_id) in l["detail"])
         check("target_type=candidate", l["target_type"] == "candidate")
 
-    step("2.5", "验证变更日志列表可查")
+    step("2.4", "验证变更日志列表可查")
     resp = requests.get(f"{BASE_URL}/api/candidate/change-logs", headers=admin_h)
     check("变更日志列表返回200", resp.status_code == 200)
     change_logs = resp.json()
@@ -170,11 +170,7 @@ def main():
 
     section("3. 普通角色权限拒绝")
 
-    step("3.1", "导入计算批次C")
-    batch_c_id, _ = import_and_calculate("候选回归-批次C", rule_id, "CND-003", "候选供应商C", admin_h)
-    check("批次C导入计算成功", batch_c_id is not None)
-
-    step("3.2", "普通用户尝试设置候选")
+    step("3.1", "普通用户尝试设置候选（批次C已预先导入）")
     candidate_req_c = {
         "batch_id": batch_c_id,
         "change_description": "普通用户尝试设候选",
@@ -183,17 +179,17 @@ def main():
     resp = requests.post(f"{BASE_URL}/api/candidate/set", json=candidate_req_c, headers=user_h)
     check("普通用户设置候选被拒403", resp.status_code == 403, f"actual={resp.status_code}")
 
-    step("3.3", "普通用户尝试取消候选")
+    step("3.2", "普通用户尝试取消候选")
     resp = requests.post(f"{BASE_URL}/api/candidate/cancel?operated_by=user1&reason=非法取消", headers=user_h)
     check("普通用户取消候选被拒403", resp.status_code == 403, f"actual={resp.status_code}")
 
-    step("3.4", "验证权限拒绝审计")
+    step("3.3", "验证权限拒绝审计")
     resp = requests.get(f"{BASE_URL}/api/audit-logs?action=permission_denied", headers=admin_h)
     logs = resp.json()
     user_denied = [l for l in logs if l["operator"] == "user1" and "candidate" in l.get("detail", "")]
     check("权限拒绝审计存在", len(user_denied) >= 1, f"count={len(user_denied)}")
 
-    step("3.5", "验证当前候选未变(仍是批次B)")
+    step("3.4", "验证当前候选未变(仍是批次B)")
     resp = requests.get(f"{BASE_URL}/api/candidate/current", headers=admin_h)
     check("当前候选仍为批次B", resp.json()["batch_id"] == batch_b_id)
 
@@ -343,17 +339,128 @@ def main():
     check("未计算批次设置候选被拒400", resp.status_code == 400, f"actual={resp.status_code}")
     check("错误信息包含'尚未完成计算'", "尚未完成计算" in resp.json().get("detail", ""))
 
-    section("8. 候选与活动版本不一致时的导出")
+    section("7.5 导入同规则新批次自动清空旧候选")
 
-    step("8.1", "设置一个非活动版本的候选")
-    batch_e_id, _ = import_and_calculate("候选回归-批次E", rule_id, "CND-006", "候选供应商E", admin_h)
+    step("7.5.1", "设置批次E为当前候选")
+    batch_e_id, _ = import_and_calculate("候选回归-批次E-同规则测试", rule_id, "CND-SAME-001", "同规则供应商1", admin_h)
     candidate_req_e = {
         "batch_id": batch_e_id,
-        "change_description": "非活动版本候选",
+        "change_description": "同规则测试-旧候选",
         "set_by": "admin"
     }
     resp = requests.post(f"{BASE_URL}/api/candidate/set", json=candidate_req_e, headers=admin_h)
     check("设置候选E返回200", resp.status_code == 200)
+    old_candidate_id = resp.json()["candidate"]["id"]
+
+    step("7.5.2", "验证当前候选是批次E")
+    resp = requests.get(f"{BASE_URL}/api/candidate/current", headers=admin_h)
+    check("当前候选是批次E", resp.json()["batch_id"] == batch_e_id)
+
+    step("7.5.3", "先发布一个旧批次获得活动版本（用于导出验证）")
+    batch_release_id, _ = import_and_calculate("候选回归-发布批次", rule_id, "CND-REL-001", "发布供应商", admin_h)
+    approve_release = {"approved_by": "admin", "approval_remark": "获得活动版本"}
+    resp = requests.post(f"{BASE_URL}/api/batches/{batch_release_id}/release", json=approve_release, headers=admin_h)
+    check("发布成功", resp.status_code == 200)
+    v_release_version = resp.json()["version"] if resp.status_code == 200 else ""
+
+    step("7.5.4", "重新设置批次E为候选")
+    candidate_req_e2 = {
+        "batch_id": batch_e_id,
+        "change_description": "重新设置候选E",
+        "set_by": "admin"
+    }
+    resp = requests.post(f"{BASE_URL}/api/candidate/set", json=candidate_req_e2, headers=admin_h)
+    check("重新设置候选E返回200", resp.status_code == 200)
+
+    step("7.5.5", "导入同规则新批次F（关键：应自动清空旧候选）")
+    batch_f = {
+        "batch_name": "候选回归-批次F-同规则新批次",
+        "rule_id": rule_id,
+        "imported_by": "admin",
+        "suppliers": [
+            {"supplier_code": "CND-SAME-002", "supplier_name": "同规则供应商2",
+             "metrics": {"pass_rate": 0.95, "defect_rate": 0.02, "on_time_rate": 0.93,
+                         "lead_time_days": 14, "price_competitiveness": 85, "payment_terms_score": 72}}
+        ]
+    }
+    resp = requests.post(f"{BASE_URL}/api/batches/import", json=batch_f, headers=admin_h)
+    check("批次F导入成功", resp.status_code == 200)
+    batch_f_id = resp.json()["id"]
+
+    step("7.5.6", "验证候选已被清空（返回404）")
+    resp = requests.get(f"{BASE_URL}/api/candidate/current", headers=admin_h)
+    check("候选已清空返回404", resp.status_code == 404, f"actual={resp.status_code}")
+
+    step("7.5.7", "验证导出中没有过期候选残留")
+    resp = requests.get(f"{BASE_URL}/api/export/active", headers=admin_h)
+    check("导出返回200", resp.status_code == 200)
+    if resp.status_code == 200:
+        export = resp.json()
+        check("导出版本正确", export["version"] == v_release_version)
+        check("导出candidate_batch_id为空", export.get("candidate_batch_id") is None,
+              f"actual={export.get('candidate_batch_id')}")
+        check("导出candidate_matches_active为空", export.get("candidate_matches_active") is None,
+              f"actual={export.get('candidate_matches_active')}")
+
+    step("7.5.8", "验证变更日志记录了导入清空")
+    resp = requests.get(f"{BASE_URL}/api/candidate/change-log/latest", headers=admin_h)
+    check("变更日志返回200", resp.status_code == 200)
+    if resp.status_code == 200:
+        latest = resp.json()
+        check("变更原因包含'导入同规则'或'自动失效'",
+              "导入同规则" in latest["change_reason"] or "自动失效" in latest["change_reason"],
+              f"actual={latest['change_reason']}")
+        check("new_candidate_id为空", latest["new_candidate_id"] is None)
+        check("old_candidate_id非空", latest["old_candidate_id"] is not None)
+
+    step("7.5.9", "验证candidate_cleared_on_import审计记录")
+    resp = requests.get(f"{BASE_URL}/api/audit-logs?action=candidate_cleared_on_import", headers=admin_h)
+    logs = resp.json()
+    check("candidate_cleared_on_import审计存在", len(logs) >= 1, f"count={len(logs)}")
+    if logs:
+        l = logs[0]
+        check("action=candidate_cleared_on_import", l["action"] == "candidate_cleared_on_import")
+        check("target_type=candidate", l["target_type"] == "candidate")
+        check("target_id=旧候选ID", l["target_id"] == str(old_candidate_id + 1) or l["target_id"] == str(old_candidate_id),
+              f"target_id={l['target_id']}, old_id={old_candidate_id}")
+        check("result=cleared", l["result"] == "cleared")
+        check("detail包含变更原因", "导入同规则" in l["detail"] or "自动失效" in l["detail"])
+
+    step("7.5.10", "不同规则的候选不应被清空")
+    resp = requests.get(f"{BASE_URL}/api/rules", headers=admin_h)
+    all_rules = resp.json()
+    if len(all_rules) >= 2:
+        rule2_id = all_rules[1]["id"]
+        batch_diff_id, _ = import_and_calculate("候选回归-不同规则批次", rule2_id, "CND-DIFF-001", "不同规则供应商", admin_h)
+        candidate_req_diff = {
+            "batch_id": batch_diff_id,
+            "change_description": "不同规则候选",
+            "set_by": "admin"
+        }
+        resp = requests.post(f"{BASE_URL}/api/candidate/set", json=candidate_req_diff, headers=admin_h)
+        check("设置不同规则候选返回200", resp.status_code == 200)
+        batch_same_rule_id, _ = import_and_calculate("候选回归-规则1新批次", rule_id, "CND-SAME-003", "规则1新供应商", admin_h)
+        resp = requests.post(f"{BASE_URL}/api/batches/import", json={
+            "batch_name": "规则1新批次-验证不同规则",
+            "rule_id": rule_id,
+            "imported_by": "admin",
+            "suppliers": [{"supplier_code": "CND-SAME-004", "supplier_name": "测试", "metrics": {"pass_rate": 0.9}}]
+        }, headers=admin_h)
+        check("导入规则1新批次返回200", resp.status_code == 200)
+        resp = requests.get(f"{BASE_URL}/api/candidate/current", headers=admin_h)
+        check("不同规则候选仍保留", resp.status_code == 200 and resp.json()["batch_id"] == batch_diff_id)
+
+    section("8. 候选与活动版本不一致时的导出")
+
+    step("8.1", "设置一个非活动版本的候选")
+    batch_e2_id, _ = import_and_calculate("候选回归-批次E2", rule_id, "CND-006", "候选供应商E2", admin_h)
+    candidate_req_e2 = {
+        "batch_id": batch_e2_id,
+        "change_description": "非活动版本候选",
+        "set_by": "admin"
+    }
+    resp = requests.post(f"{BASE_URL}/api/candidate/set", json=candidate_req_e2, headers=admin_h)
+    check("设置候选E2返回200", resp.status_code == 200)
 
     step("8.2", "导出中候选与活动版本不一致")
     resp = requests.get(f"{BASE_URL}/api/export/active", headers=admin_h)
@@ -369,8 +476,10 @@ def main():
     step("9.1", "抽查所有候选相关审计日志的6字段完整性")
     resp = requests.get(f"{BASE_URL}/api/audit-logs?limit=200", headers=admin_h)
     all_logs = resp.json()
-    candidate_logs = [l for l in all_logs if l["action"] in ("set_candidate", "cancel_candidate", "candidate_replaced")]
-    check("候选相关审计>=3条", len(candidate_logs) >= 3, f"count={len(candidate_logs)}")
+    candidate_logs = [l for l in all_logs if l["action"] in (
+        "set_candidate", "cancel_candidate", "candidate_replaced", "candidate_cleared_on_import"
+    )]
+    check("候选相关审计>=5条", len(candidate_logs) >= 5, f"count={len(candidate_logs)}")
     all_complete = all(
         l["action"] and l["operator"] and l["target_type"] and l["target_id"] is not None
         and l["result"] and l["created_at"]
