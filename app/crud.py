@@ -173,6 +173,18 @@ def approve_and_release(db: Session, batch_id: int, approve_data: schemas.Approv
     ).update({"is_active": False})
 
     db_batch.status = "released"
+
+    current_candidate = get_current_candidate(db)
+    if current_candidate:
+        current_candidate.is_current = False
+        change_log = models.CandidateChangeLog(
+            old_candidate_id=current_candidate.id,
+            new_candidate_id=None,
+            change_reason=f"批次{batch_id}正式发布(v{db_release.version})，候选自动清空",
+            operated_by=approve_data.approved_by,
+        )
+        db.add(change_log)
+
     db.commit()
     db.refresh(db_release)
 
@@ -222,6 +234,17 @@ def rollback_to_version(db: Session, rollback_data: schemas.RollbackRequest):
     )
     db.add(rollback_record)
 
+    current_candidate = get_current_candidate(db)
+    if current_candidate:
+        current_candidate.is_current = False
+        candidate_change_log = models.CandidateChangeLog(
+            old_candidate_id=current_candidate.id,
+            new_candidate_id=None,
+            change_reason=f"版本回滚(从{current_active.version}到{target_release.version})，候选自动清空",
+            operated_by=rollback_data.operated_by,
+        )
+        db.add(candidate_change_log)
+
     db.commit()
     db.refresh(target_release)
     db.refresh(rollback_record)
@@ -239,7 +262,11 @@ def export_active_scores(db: Session):
         return None
 
     scores = get_released_scores(db, active_release.id)
-    return active_release, scores
+    candidate = get_current_candidate(db)
+    candidate_batch_id = candidate.batch_id if candidate else None
+    candidate_matches_active = (candidate.batch_id == active_release.batch_id) if candidate and active_release else None
+
+    return active_release, scores, candidate_batch_id, candidate_matches_active
 
 
 def create_user(db: Session, username: str, role: str):
@@ -271,6 +298,84 @@ def write_audit_log(db: Session, action: str, operator: str, target_type: str, t
     db.commit()
     db.refresh(log)
     return log
+
+
+def set_release_candidate(db: Session, candidate_data: schemas.SetCandidateRequest):
+    db_batch = get_batch(db, candidate_data.batch_id)
+    if not db_batch:
+        raise ValueError("批次不存在")
+    if db_batch.status != "calculated":
+        raise ValueError("批次尚未完成计算，不能设为候选")
+
+    old_candidate = get_current_candidate(db)
+    old_candidate_id = old_candidate.id if old_candidate else None
+
+    if old_candidate:
+        old_candidate.is_current = False
+
+    new_candidate = models.ReleaseCandidate(
+        batch_id=candidate_data.batch_id,
+        rule_id=db_batch.rule_id,
+        change_description=candidate_data.change_description,
+        expected_effective_time=candidate_data.expected_effective_time,
+        operation_remark=candidate_data.operation_remark or "",
+        set_by=candidate_data.set_by,
+        is_current=True,
+    )
+    db.add(new_candidate)
+    db.flush()
+
+    change_reason = f"设置批次{candidate_data.batch_id}为候选发布"
+    if old_candidate:
+        change_reason = f"替换候选: 旧候选批次{old_candidate.batch_id}被新候选批次{candidate_data.batch_id}顶替"
+
+    change_log = models.CandidateChangeLog(
+        old_candidate_id=old_candidate_id,
+        new_candidate_id=new_candidate.id,
+        change_reason=change_reason,
+        operated_by=candidate_data.set_by,
+    )
+    db.add(change_log)
+
+    db.commit()
+    db.refresh(new_candidate)
+    return new_candidate, change_log
+
+
+def clear_candidate(db: Session, reason: str, operated_by: str):
+    current = get_current_candidate(db)
+    if not current:
+        return None
+
+    current.is_current = False
+    change_log = models.CandidateChangeLog(
+        old_candidate_id=current.id,
+        new_candidate_id=None,
+        change_reason=reason,
+        operated_by=operated_by,
+    )
+    db.add(change_log)
+    db.commit()
+    db.refresh(current)
+    return current, change_log
+
+
+def get_current_candidate(db: Session):
+    return db.query(models.ReleaseCandidate).filter(
+        models.ReleaseCandidate.is_current == True
+    ).first()
+
+
+def get_latest_candidate_change_log(db: Session):
+    return db.query(models.CandidateChangeLog).order_by(
+        models.CandidateChangeLog.operated_at.desc()
+    ).first()
+
+
+def list_candidate_change_logs(db: Session, skip: int = 0, limit: int = 100):
+    return db.query(models.CandidateChangeLog).order_by(
+        models.CandidateChangeLog.operated_at.desc()
+    ).offset(skip).limit(limit).all()
 
 
 def has_duplicate_rejected_audit(db: Session, batch_id: str):

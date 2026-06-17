@@ -171,6 +171,41 @@ class ExportResultItem(BaseModel):
     score_details: Dict[str, Any]
 
 
+class SetCandidateRequest(BaseModel):
+    batch_id: int
+    change_description: str
+    expected_effective_time: Optional[datetime] = None
+    operation_remark: Optional[str] = ""
+    set_by: str
+
+
+class ReleaseCandidateResponse(BaseModel):
+    id: int
+    batch_id: int
+    rule_id: int
+    change_description: str
+    expected_effective_time: Optional[datetime] = None
+    operation_remark: str
+    set_by: str
+    set_at: datetime
+    is_current: bool
+
+    class Config:
+        from_attributes = True
+
+
+class CandidateChangeLogResponse(BaseModel):
+    id: int
+    old_candidate_id: Optional[int] = None
+    new_candidate_id: Optional[int] = None
+    change_reason: str
+    operated_by: str
+    operated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ExportResponse(BaseModel):
     version: str
     released_at: datetime
@@ -178,3 +213,5 @@ class ExportResponse(BaseModel):
     release_note: str
     supplier_count: int
     scores: List[ExportResultItem]
+    candidate_batch_id: Optional[int] = None
+    candidate_matches_active: Optional[bool] = None

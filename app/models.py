@@ -119,6 +119,34 @@ class AuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class ReleaseCandidate(Base):
+    __tablename__ = "release_candidates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("supplier_batches.id"), nullable=False)
+    rule_id = Column(Integer, ForeignKey("scoring_rules.id"), nullable=False)
+    change_description = Column(Text, default="")
+    expected_effective_time = Column(DateTime, nullable=True)
+    operation_remark = Column(Text, default="")
+    set_by = Column(String(100), nullable=False)
+    set_at = Column(DateTime, default=datetime.utcnow)
+    is_current = Column(Boolean, default=True)
+
+    batch = relationship("SupplierBatch")
+    rule = relationship("ScoringRule")
+
+
+class CandidateChangeLog(Base):
+    __tablename__ = "candidate_change_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    old_candidate_id = Column(Integer, nullable=True)
+    new_candidate_id = Column(Integer, nullable=True)
+    change_reason = Column(Text, default="")
+    operated_by = Column(String(100), nullable=False)
+    operated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class User(Base):
     __tablename__ = "users"
 

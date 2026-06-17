@@ -364,7 +364,7 @@ def export_active(
     if not result:
         raise HTTPException(status_code=404, detail="当前没有活动版本")
 
-    release, scores = result
+    release, scores, candidate_batch_id, candidate_matches_active = result
     score_items = [
         schemas.ExportResultItem(
             supplier_code=s.supplier_code,
@@ -382,6 +382,8 @@ def export_active(
         release_note=release.release_note,
         supplier_count=release.supplier_count,
         scores=score_items,
+        candidate_batch_id=candidate_batch_id,
+        candidate_matches_active=candidate_matches_active,
     )
 
 
@@ -404,3 +406,105 @@ def list_users(
     _=Depends(auth.require_role([auth.ROLE_ADMIN]))
 ):
     return crud.list_users(db)
+
+
+@app.post("/api/candidate/set", response_model=dict)
+def set_candidate(
+    candidate_data: schemas.SetCandidateRequest,
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role(auth.ALLOW_CANDIDATE_ROLES))
+):
+    try:
+        candidate, change_log = crud.set_release_candidate(db, candidate_data)
+        crud.write_audit_log(
+            db,
+            action="set_candidate",
+            operator=candidate_data.set_by,
+            target_type="candidate",
+            target_id=str(candidate.id),
+            result="success",
+            detail=f"设置批次{candidate_data.batch_id}为候选发布, 变更说明: {candidate_data.change_description}",
+        )
+        if change_log.old_candidate_id:
+            crud.write_audit_log(
+                db,
+                action="candidate_replaced",
+                operator=candidate_data.set_by,
+                target_type="candidate",
+                target_id=str(change_log.old_candidate_id),
+                result="replaced",
+                detail=f"候选被顶替: 旧候选ID={change_log.old_candidate_id}, 新候选ID={change_log.new_candidate_id}, 原因: {change_log.change_reason}",
+            )
+        return {
+            "candidate": schemas.ReleaseCandidateResponse.model_validate(candidate).model_dump(),
+            "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump(),
+        }
+    except ValueError as e:
+        crud.write_audit_log(
+            db,
+            action="set_candidate",
+            operator=candidate_data.set_by,
+            target_type="candidate",
+            target_id=str(candidate_data.batch_id),
+            result="rejected",
+            detail=str(e),
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/candidate/cancel", response_model=dict)
+def cancel_candidate(
+    operated_by: str,
+    reason: str = "",
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role(auth.ALLOW_CANDIDATE_ROLES))
+):
+    result = crud.clear_candidate(db, reason=reason or "手动取消候选", operated_by=operated_by)
+    if not result:
+        raise HTTPException(status_code=404, detail="当前没有候选发布")
+    old_candidate, change_log = result
+    crud.write_audit_log(
+        db,
+        action="cancel_candidate",
+        operator=operated_by,
+        target_type="candidate",
+        target_id=str(old_candidate.id),
+        result="success",
+        detail=f"取消候选批次{old_candidate.batch_id}, 原因: {reason or '手动取消候选'}",
+    )
+    return {
+        "candidate": schemas.ReleaseCandidateResponse.model_validate(old_candidate).model_dump(),
+        "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump(),
+    }
+
+
+@app.get("/api/candidate/current", response_model=schemas.ReleaseCandidateResponse)
+def get_current_candidate(
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user)
+):
+    candidate = crud.get_current_candidate(db)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="当前没有候选发布")
+    return candidate
+
+
+@app.get("/api/candidate/change-log/latest", response_model=schemas.CandidateChangeLogResponse)
+def get_latest_candidate_change(
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user)
+):
+    change_log = crud.get_latest_candidate_change_log(db)
+    if not change_log:
+        raise HTTPException(status_code=404, detail="没有候选变更记录")
+    return change_log
+
+
+@app.get("/api/candidate/change-logs", response_model=List[schemas.CandidateChangeLogResponse])
+def list_candidate_change_logs(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user)
+):
+    return crud.list_candidate_change_logs(db, skip, limit)
