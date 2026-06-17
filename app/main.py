@@ -252,6 +252,8 @@ def approve_and_release(
     except ValueError as e:
         error_detail = str(e)
         is_duplicate = "已发布过" in error_detail
+        if is_duplicate and crud.has_duplicate_rejected_audit(db, str(batch_id)):
+            raise HTTPException(status_code=400, detail=error_detail)
         crud.write_audit_log(
             db,
             action="release",

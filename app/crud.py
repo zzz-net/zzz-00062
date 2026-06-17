@@ -273,6 +273,14 @@ def write_audit_log(db: Session, action: str, operator: str, target_type: str, t
     return log
 
 
+def has_duplicate_rejected_audit(db: Session, batch_id: str):
+    return db.query(models.AuditLog).filter(
+        models.AuditLog.action == "release",
+        models.AuditLog.result == "duplicate_rejected",
+        models.AuditLog.target_id == batch_id,
+    ).first() is not None
+
+
 def list_audit_logs(db: Session, action: str = None, operator: str = None, target_type: str = None, skip: int = 0, limit: int = 100):
     q = db.query(models.AuditLog)
     if action:
