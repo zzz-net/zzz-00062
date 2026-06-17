@@ -256,3 +256,29 @@ def get_user(db: Session, username: str):
 
 def list_users(db: Session):
     return db.query(models.User).all()
+
+
+def write_audit_log(db: Session, action: str, operator: str, target_type: str, target_id: str, result: str, detail: str = ""):
+    log = models.AuditLog(
+        action=action,
+        operator=operator,
+        target_type=target_type,
+        target_id=target_id,
+        result=result,
+        detail=detail,
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+def list_audit_logs(db: Session, action: str = None, operator: str = None, target_type: str = None, skip: int = 0, limit: int = 100):
+    q = db.query(models.AuditLog)
+    if action:
+        q = q.filter(models.AuditLog.action == action)
+    if operator:
+        q = q.filter(models.AuditLog.operator == operator)
+    if target_type:
+        q = q.filter(models.AuditLog.target_type == target_type)
+    return q.order_by(models.AuditLog.created_at.desc()).offset(skip).limit(limit).all()

@@ -106,6 +106,19 @@ class RollbackRecord(Base):
     operated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    action = Column(String(50), nullable=False, index=True)
+    operator = Column(String(100), nullable=False)
+    target_type = Column(String(50), nullable=False)
+    target_id = Column(String(100), nullable=False)
+    result = Column(String(20), nullable=False)
+    detail = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class User(Base):
     __tablename__ = "users"
 

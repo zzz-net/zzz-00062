@@ -149,6 +149,20 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 
+class AuditLogResponse(BaseModel):
+    id: int
+    action: str
+    operator: str
+    target_type: str
+    target_id: str
+    result: str
+    detail: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ExportResultItem(BaseModel):
     supplier_code: str
     supplier_name: str
