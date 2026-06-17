@@ -2,12 +2,22 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from contextlib import asynccontextmanager
 from .database import engine, Base, get_db
 from . import models, schemas, crud, auth
+from .scheduler import scheduler
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="供应商评分重算服务", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start()
+    yield
+    scheduler.stop()
+
+
+app = FastAPI(title="供应商评分重算服务", version="1.0.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -374,7 +384,7 @@ def export_active(
     if not result:
         raise HTTPException(status_code=404, detail="当前没有活动版本")
 
-    release, scores, candidate_batch_id, candidate_matches_active = result
+    release, scores, candidate_batch_id, candidate_matches_active, release_source = result
     score_items = [
         schemas.ExportResultItem(
             supplier_code=s.supplier_code,
@@ -394,6 +404,7 @@ def export_active(
         scores=score_items,
         candidate_batch_id=candidate_batch_id,
         candidate_matches_active=candidate_matches_active,
+        release_source=release_source or "manual",
     )
 
 
@@ -518,3 +529,148 @@ def list_candidate_change_logs(
     user=Depends(auth.get_current_user)
 ):
     return crud.list_candidate_change_logs(db, skip, limit)
+
+
+@app.post("/api/scheduled-releases", response_model=dict)
+def create_scheduled_release(
+    req: schemas.ScheduleReleaseRequest,
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role(auth.ALLOW_CANDIDATE_ROLES)),
+):
+    try:
+        sched, candidate, change_log = crud.create_scheduled_release(db, req)
+        crud.write_audit_log(
+            db,
+            action="create_scheduled_release",
+            operator=req.set_by,
+            target_type="scheduled_release",
+            target_id=str(sched.id),
+            result="success",
+            detail=f"创建预约发布: 批次={req.batch_id}, 计划生效时间={req.scheduled_time.isoformat()}",
+        )
+        crud.write_audit_log(
+            db,
+            action="set_candidate",
+            operator=req.set_by,
+            target_type="candidate",
+            target_id=str(candidate.id),
+            result="success",
+            detail=f"设置批次{req.batch_id}为预约发布候选, 变更说明: {req.change_description}",
+        )
+        if change_log.old_candidate_id:
+            crud.write_audit_log(
+                db,
+                action="candidate_replaced",
+                operator=req.set_by,
+                target_type="candidate",
+                target_id=str(change_log.old_candidate_id),
+                result="replaced",
+                detail=f"候选被顶替(预约): 旧候选ID={change_log.old_candidate_id}, 新候选ID={change_log.new_candidate_id}",
+            )
+        return {
+            "scheduled_release": schemas.ScheduledReleaseResponse.model_validate(sched).model_dump(),
+            "candidate": schemas.ReleaseCandidateResponse.model_validate(candidate).model_dump(),
+            "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump(),
+        }
+    except ValueError as e:
+        crud.write_audit_log(
+            db,
+            action="create_scheduled_release",
+            operator=req.set_by,
+            target_type="scheduled_release",
+            target_id=str(req.batch_id),
+            result="rejected",
+            detail=str(e),
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/scheduled-releases/{sched_id}/cancel", response_model=dict)
+def cancel_scheduled_release(
+    sched_id: int,
+    operated_by: str,
+    reason: str = "",
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role(auth.ALLOW_CANDIDATE_ROLES)),
+):
+    try:
+        sched, change_log = crud.cancel_scheduled_release(
+            db, sched_id, reason=reason or "手动取消预约", operated_by=operated_by
+        )
+        crud.write_audit_log(
+            db,
+            action="cancel_scheduled_release",
+            operator=operated_by,
+            target_type="scheduled_release",
+            target_id=str(sched.id),
+            result="success",
+            detail=f"取消预约发布: 批次={sched.batch_id}, 原因: {reason or '手动取消预约'}",
+        )
+        if change_log:
+            crud.write_audit_log(
+                db,
+                action="cancel_candidate",
+                operator=operated_by,
+                target_type="candidate",
+                target_id=str(change_log.old_candidate_id),
+                result="success",
+                detail=f"取消候选(随预约取消): 原因={reason or '手动取消预约'}",
+            )
+        return {
+            "scheduled_release": schemas.ScheduledReleaseResponse.model_validate(sched).model_dump(),
+            "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump() if change_log else None,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/scheduled-releases", response_model=List[schemas.ScheduledReleaseResponse])
+def list_scheduled_releases(
+    status: Optional[str] = None,
+    rule_id: Optional[int] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    return crud.list_scheduled_releases(db, status=status, rule_id=rule_id, skip=skip, limit=limit)
+
+
+@app.get("/api/scheduled-releases/{sched_id}", response_model=schemas.ScheduledReleaseDetailResponse)
+def get_scheduled_release(
+    sched_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    sched = crud.get_scheduled_release(db, sched_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail="预约发布记录不存在")
+    return schemas.ScheduledReleaseDetailResponse(
+        id=sched.id,
+        candidate_id=sched.candidate_id,
+        batch_id=sched.batch_id,
+        rule_id=sched.rule_id,
+        scheduled_time=sched.scheduled_time,
+        status=sched.status,
+        cancel_reason=sched.cancel_reason,
+        release_version_id=sched.release_version_id,
+        created_by=sched.created_by,
+        created_at=sched.created_at,
+        executed_at=sched.executed_at,
+        cancelled_at=sched.cancelled_at,
+        cancelled_by=sched.cancelled_by,
+        candidate=schemas.ReleaseCandidateResponse.model_validate(sched.candidate) if sched.candidate else None,
+        release_version=schemas.ReleaseVersionResponse.model_validate(sched.release_version) if sched.release_version else None,
+    )
+
+
+@app.get("/api/scheduled-releases/rule/{rule_id}/latest", response_model=schemas.ScheduledReleaseResponse)
+def get_latest_schedule_for_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    sched = crud.get_latest_schedule_for_rule(db, rule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail="该规则没有预约发布记录")
+    return sched

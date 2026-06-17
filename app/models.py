@@ -75,10 +75,12 @@ class ReleaseVersion(Base):
     approved_by = Column(String(100), nullable=False)
     released_at = Column(DateTime, default=datetime.utcnow)
     supplier_count = Column(Integer, default=0)
+    release_source = Column(String(20), default="manual")
 
     batch = relationship("SupplierBatch")
     rule = relationship("ScoringRule")
     released_scores = relationship("ReleasedScore", back_populates="release", cascade="all, delete-orphan")
+    scheduled_release = relationship("ScheduledRelease", back_populates="release_version", uselist=False)
 
 
 class ReleasedScore(Base):
@@ -134,6 +136,28 @@ class ReleaseCandidate(Base):
 
     batch = relationship("SupplierBatch")
     rule = relationship("ScoringRule")
+    scheduled_release = relationship("ScheduledRelease", back_populates="candidate", uselist=False)
+
+
+class ScheduledRelease(Base):
+    __tablename__ = "scheduled_releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    candidate_id = Column(Integer, ForeignKey("release_candidates.id"), nullable=False)
+    batch_id = Column(Integer, ForeignKey("supplier_batches.id"), nullable=False)
+    rule_id = Column(Integer, ForeignKey("scoring_rules.id"), nullable=False)
+    scheduled_time = Column(DateTime, nullable=False, index=True)
+    status = Column(String(20), default="pending", index=True)
+    cancel_reason = Column(Text, default="")
+    release_version_id = Column(Integer, ForeignKey("release_versions.id"), nullable=True)
+    created_by = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    executed_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(String(100), nullable=True)
+
+    candidate = relationship("ReleaseCandidate", back_populates="scheduled_release")
+    release_version = relationship("ReleaseVersion", back_populates="scheduled_release")
 
 
 class CandidateChangeLog(Base):

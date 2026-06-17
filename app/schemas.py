@@ -103,6 +103,7 @@ class ReleaseVersionResponse(BaseModel):
     approved_by: str
     released_at: datetime
     supplier_count: int
+    release_source: str = "manual"
 
     class Config:
         from_attributes = True
@@ -215,3 +216,38 @@ class ExportResponse(BaseModel):
     scores: List[ExportResultItem]
     candidate_batch_id: Optional[int] = None
     candidate_matches_active: Optional[bool] = None
+    release_source: str = "manual"
+
+
+class ScheduleReleaseRequest(BaseModel):
+    batch_id: int
+    scheduled_time: datetime
+    change_description: str = ""
+    operation_remark: Optional[str] = ""
+    release_note: Optional[str] = ""
+    approval_remark: Optional[str] = ""
+    set_by: str
+
+
+class ScheduledReleaseResponse(BaseModel):
+    id: int
+    candidate_id: int
+    batch_id: int
+    rule_id: int
+    scheduled_time: datetime
+    status: str
+    cancel_reason: str
+    release_version_id: Optional[int] = None
+    created_by: str
+    created_at: datetime
+    executed_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+    cancelled_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ScheduledReleaseDetailResponse(ScheduledReleaseResponse):
+    candidate: Optional[ReleaseCandidateResponse] = None
+    release_version: Optional[ReleaseVersionResponse] = None
