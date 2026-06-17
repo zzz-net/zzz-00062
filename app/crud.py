@@ -272,11 +272,11 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
     old_candidate = get_current_candidate(db)
     old_candidate_id = old_candidate.id if old_candidate else None
 
-    if old_candidate and old_candidate.batch_id != req.batch_id:
+    if old_candidate:
         old_candidate.is_current = False
         cancel_scheduled_releases_for_candidate(
             db, old_candidate.id,
-            reason=f"候选被批次{req.batch_id}顶替，关联预约自动取消",
+            reason=f"候选被批次{req.batch_id}顶替(预约发布)，关联预约自动取消",
             operated_by=req.set_by,
             flush=False,
         )
@@ -394,8 +394,9 @@ def cancel_scheduled_release(db: Session, sched_id: int, reason: str, operated_b
         )
         db.add(change_log)
 
+    plan_result = None
     try:
-        handle_cancel_scheduled_release_plan(
+        plan_result = handle_cancel_scheduled_release_plan(
             db,
             scheduled_release_id=sched_id,
             cancelled_by=operated_by,
@@ -406,7 +407,7 @@ def cancel_scheduled_release(db: Session, sched_id: int, reason: str, operated_b
 
     db.commit()
     db.refresh(sched)
-    return sched, change_log
+    return sched, change_log, plan_result
 
 
 def list_scheduled_releases(db: Session, status: str = None, rule_id: int = None, skip: int = 0, limit: int = 100):
@@ -672,8 +673,9 @@ def clear_candidate(db: Session, reason: str, operated_by: str):
     )
     db.add(change_log)
 
+    plan_handle_result = None
     try:
-        handle_cancel_candidate_plan(
+        plan_handle_result = handle_cancel_candidate_plan(
             db,
             rule_id=current.rule_id,
             cancelled_by=operated_by,
@@ -684,7 +686,7 @@ def clear_candidate(db: Session, reason: str, operated_by: str):
 
     db.commit()
     db.refresh(current)
-    return current, change_log
+    return current, change_log, plan_handle_result
 
 
 def get_current_candidate(db: Session):
@@ -907,8 +909,24 @@ def _create_plan_record(db: Session, rule_id: int, status: str, source_type: str
     return plan
 
 
-def _supersede_plan(db: Session, plan: models.ReleasePlan, superseder_id: int, operator: str, reason: str):
+def _supersede_plan(db: Session, plan: models.ReleasePlan, superseder_id: int, operator: str, reason: str,
+                    extra_detail: dict | None = None):
     old_status = plan.status
+    if old_status in (models.PLAN_STATUS_SUPERSEDED, models.PLAN_STATUS_EXECUTED,
+                      models.PLAN_STATUS_CANCELLED, models.PLAN_STATUS_EXPIRED,
+                      models.PLAN_STATUS_FAILED):
+        event_detail = {
+            "superseded_by_plan_id": superseder_id,
+            "idempotent_skip": True,
+            "skip_reason": f"已处于终态{old_status}，跳过supersede以保证幂等",
+            "plan_source_type": plan.source_type,
+            "plan_type": plan.plan_type,
+        }
+        if extra_detail:
+            event_detail.update(extra_detail)
+        _add_plan_event(db, plan.id, "superseded_skip_idempotent", old_status, old_status,
+                        operator, f"幂等跳过: {reason}", event_detail)
+        return False
     now = datetime.utcnow()
     plan.status = models.PLAN_STATUS_SUPERSEDED
     plan.superseded_at = now
@@ -918,8 +936,23 @@ def _supersede_plan(db: Session, plan: models.ReleasePlan, superseder_id: int, o
     plan.executed_at = None
     plan.cancelled_at = None
     plan.expired_at = None
+    existing_source = plan.source_detail or ""
+    if "被顶掉" not in existing_source:
+        plan.source_detail = (existing_source + " | " if existing_source else "") + f"被顶掉(by={operator}, reason={reason[:50]})"
+    event_detail = {
+        "superseded_by_plan_id": superseder_id,
+        "plan_source_type": plan.source_type,
+        "plan_type": plan.plan_type,
+        "batch_id": plan.batch_id,
+        "candidate_id": plan.candidate_id,
+        "scheduled_release_id": plan.scheduled_release_id,
+        "idempotent_skip": False,
+    }
+    if extra_detail:
+        event_detail.update(extra_detail)
     _add_plan_event(db, plan.id, "superseded", old_status, models.PLAN_STATUS_SUPERSEDED,
-                    operator, reason, {"superseded_by_plan_id": superseder_id})
+                    operator, reason, event_detail)
+    return True
 
 
 def check_conflict_for_import(db: Session, rule_id: int, new_batch_id: int, imported_by: str) -> schemas.ReleasePlanConflictInfo:
@@ -949,6 +982,7 @@ def handle_import_conflict(db: Session, rule_id: int, new_batch_id: int, importe
     ).all()
 
     superseded_ids = []
+    skipped_ids = []
     new_plan = _create_plan_record(
         db, rule_id=rule_id,
         status=models.PLAN_STATUS_QUEUED,
@@ -956,15 +990,34 @@ def handle_import_conflict(db: Session, rule_id: int, new_batch_id: int, importe
         plan_type=models.PLAN_TYPE_CANDIDATE,
         created_by=imported_by,
         batch_id=new_batch_id,
-        conflict_reason="导入新批次占位",
-        source_detail=new_source_detail,
+        conflict_reason=f"导入新批次占位(trigger_by={imported_by})",
+        source_detail=f"{new_source_detail} | trigger_by={imported_by}",
     )
     db.flush()
+    _add_plan_event(db, new_plan.id, "import_conflict_created", None, models.PLAN_STATUS_QUEUED,
+                    imported_by, "导入新批次创建冲突占位计划",
+                    {"rule_id": rule_id, "new_batch_id": new_batch_id,
+                     "active_conflict_count": len(active_plans),
+                     "source_detail": new_source_detail})
 
     for plan in active_plans:
         reason = f"导入同规则(rule_id={rule_id})新批次{new_batch_id}，原计划被顶掉"
-        _supersede_plan(db, plan, new_plan.id, imported_by, reason)
-        superseded_ids.append(plan.id)
+        superseded = _supersede_plan(db, plan, new_plan.id, imported_by, reason, {
+            "supersede_source": "import_conflict",
+            "new_batch_id": new_batch_id,
+            "old_batch_id": plan.batch_id,
+            "old_plan_source_type": plan.source_type,
+            "old_plan_type": plan.plan_type,
+        })
+        if superseded:
+            superseded_ids.append(plan.id)
+        else:
+            skipped_ids.append(plan.id)
+
+    _add_plan_event(db, new_plan.id, "import_conflict_done", models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_QUEUED,
+                    imported_by, "导入冲突处理完成",
+                    {"superseded_ids": superseded_ids, "skipped_ids": skipped_ids,
+                     "superseded_count": len(superseded_ids), "skipped_count": len(skipped_ids)})
 
     return superseded_ids
 
@@ -1007,6 +1060,7 @@ def handle_manual_release_plan(db: Session, rule_id: int, batch_id: int, release
         models.ReleasePlan.status.in_([models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_SCHEDULED]),
     ).first()
 
+    superseded_other = 0
     if existing:
         old_status = existing.status
         now = datetime.utcnow()
@@ -1014,15 +1068,19 @@ def handle_manual_release_plan(db: Session, rule_id: int, batch_id: int, release
         existing.executed_at = now
         existing.release_version_id = release_version_id
         existing.updated_at = now
-        existing.conflict_reason = f"手动提前发布: {release_note}"
-        existing.source_detail = existing.source_detail or f"手动提前发布: {release_note}"
+        existing.conflict_reason = f"手动提前发布(trigger_by={released_by}): {release_note}"
+        existing_src = existing.source_detail or ""
+        if "手动提前发布" not in existing_src:
+            existing.source_detail = (existing_src + " | " if existing_src else "") + f"手动提前发布(版本ID={release_version_id}): {release_note}"
         existing.cancelled_at = None
         existing.expired_at = None
         existing.superseded_at = None
         existing.superseded_by_plan_id = None
-        _add_plan_event(db, existing.id, "manual_release", old_status, models.PLAN_STATUS_EXECUTED,
-                        released_by, f"手动提前发布，版本ID={release_version_id}",
-                        {"release_version_id": release_version_id, "release_note": release_note})
+        _add_plan_event(db, existing.id, "manual_release_promote", old_status, models.PLAN_STATUS_EXECUTED,
+                        released_by, f"手动提前发布同批次计划，版本ID={release_version_id}",
+                        {"release_version_id": release_version_id, "release_note": release_note,
+                         "promoted_from": old_status, "batch_id": batch_id,
+                         "plan_source_type": existing.source_type, "plan_type": existing.plan_type})
         result = existing
     else:
         result = _create_plan_record(
@@ -1035,9 +1093,13 @@ def handle_manual_release_plan(db: Session, rule_id: int, batch_id: int, release
             release_version_id=release_version_id,
             executed_at=datetime.utcnow(),
             planned_time=datetime.utcnow(),
-            conflict_reason=f"手动发布: {release_note}",
-            source_detail=release_note,
+            conflict_reason=f"手动发布(trigger_by={released_by}): {release_note}",
+            source_detail=f"手动发布(trigger_by={released_by}, version_id={release_version_id}): {release_note}",
         )
+        _add_plan_event(db, result.id, "manual_release_new", None, models.PLAN_STATUS_EXECUTED,
+                        released_by, f"新建手动发布计划，版本ID={release_version_id}",
+                        {"release_version_id": release_version_id, "release_note": release_note,
+                         "batch_id": batch_id, "rule_id": rule_id})
 
     other_active = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.rule_id == rule_id,
@@ -1047,7 +1109,19 @@ def handle_manual_release_plan(db: Session, rule_id: int, batch_id: int, release
 
     for plan in other_active:
         reason = f"手动发布批次{batch_id}(版本ID={release_version_id})，不同批次的排队/预约计划被顶掉"
-        _supersede_plan(db, plan, result.id, released_by, reason)
+        superseded = _supersede_plan(db, plan, result.id, released_by, reason, {
+            "supersede_source": "manual_release",
+            "release_version_id": release_version_id,
+            "release_batch_id": batch_id,
+            "old_batch_id": plan.batch_id,
+        })
+        if superseded:
+            superseded_other += 1
+
+    _add_plan_event(db, result.id, "manual_release_done", result.status, result.status,
+                    released_by, f"手动发布处理完成，顶掉{superseded_other}个其他计划",
+                    {"superseded_other_count": superseded_other,
+                     "other_active_total": len(other_active)})
 
     return result
 
@@ -1062,39 +1136,87 @@ def check_conflict_for_cancel_candidate(db: Session, rule_id: int, cancelled_by:
         return schemas.ReleasePlanConflictInfo(has_conflict=False)
 
     active = active_plans[0]
+    conflict_details = []
+    for p in active_plans:
+        conflict_details.append(
+            f"plan#{p.id}(type={p.plan_type},source={p.source_type},status={p.status},batch={p.batch_id})"
+        )
+    detail_str = "; ".join(conflict_details)
     return schemas.ReleasePlanConflictInfo(
         has_conflict=True,
         conflict_type="cancel_candidate",
         conflict_plan_id=active.id,
-        conflict_reason=f"手动取消候选，计划#{active.id}将被标记为cancelled",
-        suggestion="计划状态将变更为cancelled",
+        conflict_reason=f"手动取消候选，命中计划: {detail_str}，将联动标记为cancelled",
+        suggestion=f"共{len(active_plans)}个计划将联动取消，动作=联动取消(linked_cancel)",
     )
 
 
-def handle_cancel_candidate_plan(db: Session, rule_id: int, cancelled_by: str, reason: str) -> list[int]:
+def handle_cancel_candidate_plan(db: Session, rule_id: int, cancelled_by: str, reason: str) -> dict:
     active_plans = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.rule_id == rule_id,
         models.ReleasePlan.status.in_([models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_SCHEDULED]),
     ).all()
 
-    cancelled_ids = []
+    result = {
+        "cancelled_ids": [],
+        "skipped_ids": [],
+        "total_found": len(active_plans),
+        "action": "linked_cancel",
+        "triggered_by": cancelled_by,
+        "trigger_source": "cancel_candidate",
+        "details": [],
+    }
     now = datetime.utcnow()
     for plan in active_plans:
         old_status = plan.status
+        if old_status in (models.PLAN_STATUS_CANCELLED, models.PLAN_STATUS_SUPERSEDED,
+                          models.PLAN_STATUS_EXECUTED, models.PLAN_STATUS_EXPIRED,
+                          models.PLAN_STATUS_FAILED):
+            result["skipped_ids"].append(plan.id)
+            result["details"].append({
+                "plan_id": plan.id,
+                "action": "skipped_idempotent",
+                "reason": f"已处于终态{old_status}，跳过以保证幂等",
+                "source_type": plan.source_type,
+                "plan_type": plan.plan_type,
+            })
+            continue
         plan.status = models.PLAN_STATUS_CANCELLED
         plan.cancelled_at = now
-        plan.conflict_reason = reason
+        plan.conflict_reason = f"取消候选联动: {reason}"
         plan.updated_at = now
-        plan.source_detail = plan.source_detail or f"手动取消候选: {reason}"
+        existing_source = plan.source_detail or ""
+        if "候选取消联动" not in existing_source:
+            plan.source_detail = (existing_source + " | " if existing_source else "") + f"候选取消联动(trigger_by={cancelled_by}): {reason}"
         plan.executed_at = None
         plan.expired_at = None
         plan.superseded_at = None
         plan.superseded_by_plan_id = None
         _add_plan_event(db, plan.id, "cancelled", old_status, models.PLAN_STATUS_CANCELLED,
-                        cancelled_by, reason, {"cancel_reason": reason})
-        cancelled_ids.append(plan.id)
+                        cancelled_by, f"候选取消联动: {reason}", {
+                            "cancel_reason": reason,
+                            "cancel_source": "cancel_candidate_linked",
+                            "triggered_by": cancelled_by,
+                            "conflict_plan_id": plan.id,
+                            "source_type_before": old_status,
+                            "plan_source_type": plan.source_type,
+                            "plan_type": plan.plan_type,
+                            "action_type": "linked_cancel",
+                        })
+        result["cancelled_ids"].append(plan.id)
+        result["details"].append({
+            "plan_id": plan.id,
+            "action": "linked_cancel",
+            "old_status": old_status,
+            "new_status": models.PLAN_STATUS_CANCELLED,
+            "source_type": plan.source_type,
+            "plan_type": plan.plan_type,
+            "batch_id": plan.batch_id,
+            "candidate_id": plan.candidate_id,
+            "scheduled_release_id": plan.scheduled_release_id,
+        })
 
-    return cancelled_ids
+    return result
 
 
 def check_conflict_for_rollback(db: Session, rule_id: int, target_version: str, operated_by: str) -> schemas.ReleasePlanConflictInfo:
@@ -1127,12 +1249,17 @@ def handle_rollback_plan(db: Session, rule_id: int, target_version: str, operate
         release_version_id=release_version_id,
         executed_at=datetime.utcnow(),
         planned_time=datetime.utcnow(),
-        conflict_reason=f"从{from_version}回滚到{target_version}: {reason}",
-        source_detail=reason,
+        conflict_reason=f"回滚(trigger_by={operated_by}): 从{from_version}到{target_version}, 原因={reason[:80]}",
+        source_detail=f"回滚(trigger_by={operated_by}, from={from_version}, to={target_version}): {reason}",
     )
     db.flush()
+    _add_plan_event(db, rollback_plan.id, "rollback_executed", None, models.PLAN_STATUS_EXECUTED,
+                    operated_by, f"版本回滚执行: {from_version}->{target_version}",
+                    {"rule_id": rule_id, "from_version": from_version, "target_version": target_version,
+                     "release_version_id": release_version_id, "reason": reason})
 
     superseded_ids = []
+    skipped_ids = []
     active_plans = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.rule_id == rule_id,
         models.ReleasePlan.status.in_([models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_SCHEDULED]),
@@ -1141,8 +1268,22 @@ def handle_rollback_plan(db: Session, rule_id: int, target_version: str, operate
 
     for plan in active_plans:
         sup_reason = f"版本回滚(从{from_version}到{target_version})，排队/预约计划被顶掉"
-        _supersede_plan(db, plan, rollback_plan.id, operated_by, sup_reason)
-        superseded_ids.append(plan.id)
+        superseded = _supersede_plan(db, plan, rollback_plan.id, operated_by, sup_reason, {
+            "supersede_source": "rollback",
+            "from_version": from_version,
+            "target_version": target_version,
+            "rollback_plan_id": rollback_plan.id,
+            "old_batch_id": plan.batch_id,
+        })
+        if superseded:
+            superseded_ids.append(plan.id)
+        else:
+            skipped_ids.append(plan.id)
+
+    _add_plan_event(db, rollback_plan.id, "rollback_done", models.PLAN_STATUS_EXECUTED, models.PLAN_STATUS_EXECUTED,
+                    operated_by, "版本回滚冲突处理完成",
+                    {"superseded_ids": superseded_ids, "skipped_ids": skipped_ids,
+                     "superseded_count": len(superseded_ids), "skipped_count": len(skipped_ids)})
 
     return rollback_plan, superseded_ids
 
@@ -1151,6 +1292,7 @@ def handle_set_candidate_plan(db: Session, rule_id: int, batch_id: int, candidat
                               set_by: str, planned_time: datetime | None = None,
                               expected_effective_time: datetime | None = None) -> tuple[models.ReleasePlan, list[int]]:
     superseded_ids = []
+    skipped_ids = []
     old_active = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.rule_id == rule_id,
         models.ReleasePlan.status.in_([models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_SCHEDULED]),
@@ -1165,16 +1307,33 @@ def handle_set_candidate_plan(db: Session, rule_id: int, batch_id: int, candidat
         batch_id=batch_id,
         candidate_id=candidate_id,
         planned_time=expected_effective_time or planned_time,
-        source_detail="手动设置候选",
+        source_detail=f"手动设置候选(trigger_by={set_by})",
     )
     db.flush()
+    _add_plan_event(db, new_plan.id, "set_candidate_created", None, models.PLAN_STATUS_QUEUED,
+                    set_by, "手动设置候选创建排队计划",
+                    {"rule_id": rule_id, "batch_id": batch_id, "candidate_id": candidate_id,
+                     "planned_time": expected_effective_time.isoformat() if expected_effective_time else None,
+                     "superseded_count": len(old_active)})
 
     for plan in old_active:
         if plan.batch_id == batch_id and plan.candidate_id == candidate_id:
+            skipped_ids.append(plan.id)
+            _add_plan_event(db, new_plan.id, "set_candidate_skip_same", plan.status, plan.status,
+                            set_by, f"跳过完全相同的计划#{plan.id}(同批次同候选)",
+                            {"skipped_plan_id": plan.id, "batch_id": batch_id, "candidate_id": candidate_id})
             continue
         reason = f"手动设置批次{batch_id}为候选，旧候选批次{plan.batch_id}被顶替"
-        _supersede_plan(db, plan, new_plan.id, set_by, reason)
-        superseded_ids.append(plan.id)
+        superseded = _supersede_plan(db, plan, new_plan.id, set_by, reason, {
+            "supersede_source": "manual_candidate",
+            "new_batch_id": batch_id,
+            "new_candidate_id": candidate_id,
+            "old_batch_id": plan.batch_id,
+        })
+        if superseded:
+            superseded_ids.append(plan.id)
+        else:
+            skipped_ids.append(plan.id)
 
     return new_plan, superseded_ids
 
@@ -1183,6 +1342,7 @@ def handle_scheduled_release_plan(db: Session, rule_id: int, batch_id: int, cand
                                   scheduled_release_id: int, scheduled_time: datetime,
                                   set_by: str) -> tuple[models.ReleasePlan, list[int]]:
     superseded_ids = []
+    skipped_ids = []
     old_active = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.rule_id == rule_id,
         models.ReleasePlan.status.in_([models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_SCHEDULED]),
@@ -1198,25 +1358,44 @@ def handle_scheduled_release_plan(db: Session, rule_id: int, batch_id: int, cand
         candidate_id=candidate_id,
         scheduled_release_id=scheduled_release_id,
         planned_time=scheduled_time,
-        source_detail=f"预约到{scheduled_time.isoformat()}",
+        source_detail=f"预约到{scheduled_time.isoformat()}(trigger_by={set_by})",
     )
     db.flush()
+    _add_plan_event(db, new_plan.id, "scheduled_release_created", None, models.PLAN_STATUS_SCHEDULED,
+                    set_by, "创建预约发布计划",
+                    {"rule_id": rule_id, "batch_id": batch_id, "candidate_id": candidate_id,
+                     "scheduled_release_id": scheduled_release_id,
+                     "scheduled_time": scheduled_time.isoformat(),
+                     "superseded_count": len(old_active)})
 
     for plan in old_active:
         if plan.scheduled_release_id == scheduled_release_id:
+            skipped_ids.append(plan.id)
+            _add_plan_event(db, new_plan.id, "scheduled_skip_same", plan.status, plan.status,
+                            set_by, f"跳过同scheduled_release_id的计划#{plan.id}",
+                            {"skipped_plan_id": plan.id, "scheduled_release_id": scheduled_release_id})
             continue
         reason = f"设置批次{batch_id}预约发布({scheduled_time.isoformat()})，旧计划批次{plan.batch_id}被顶替"
-        _supersede_plan(db, plan, new_plan.id, set_by, reason)
-        superseded_ids.append(plan.id)
+        superseded = _supersede_plan(db, plan, new_plan.id, set_by, reason, {
+            "supersede_source": "scheduled_release",
+            "new_batch_id": batch_id,
+            "new_candidate_id": candidate_id,
+            "new_scheduled_release_id": scheduled_release_id,
+            "new_scheduled_time": scheduled_time.isoformat(),
+            "old_batch_id": plan.batch_id,
+        })
+        if superseded:
+            superseded_ids.append(plan.id)
+        else:
+            skipped_ids.append(plan.id)
 
     return new_plan, superseded_ids
 
 
 def handle_cancel_scheduled_release_plan(db: Session, scheduled_release_id: int, cancelled_by: str,
-                                         reason: str) -> int | None:
+                                         reason: str) -> dict | None:
     plan = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.scheduled_release_id == scheduled_release_id,
-        models.ReleasePlan.status.in_([models.PLAN_STATUS_QUEUED, models.PLAN_STATUS_SCHEDULED]),
     ).first()
 
     if not plan:
@@ -1224,18 +1403,45 @@ def handle_cancel_scheduled_release_plan(db: Session, scheduled_release_id: int,
 
     old_status = plan.status
     now = datetime.utcnow()
+    result = {
+        "plan_id": plan.id,
+        "scheduled_release_id": scheduled_release_id,
+        "old_status": old_status,
+        "action_taken": "",
+        "source_type": plan.source_type,
+        "plan_type": plan.plan_type,
+    }
+    if old_status in (models.PLAN_STATUS_CANCELLED, models.PLAN_STATUS_SUPERSEDED,
+                      models.PLAN_STATUS_EXECUTED, models.PLAN_STATUS_EXPIRED,
+                      models.PLAN_STATUS_FAILED):
+        result["action_taken"] = "skipped_idempotent"
+        result["new_status"] = old_status
+        _add_plan_event(db, plan.id, "cancelled_skip_idempotent", old_status, old_status,
+                        cancelled_by, f"幂等跳过: 已处于终态{old_status}，取消预约不再重复处理",
+                        {"cancel_reason": reason, "scheduled_release_id": scheduled_release_id,
+                         "idempotent_skip": True, "plan_source_type": plan.source_type,
+                         "plan_type": plan.plan_type})
+        return result
     plan.status = models.PLAN_STATUS_CANCELLED
     plan.cancelled_at = now
-    plan.conflict_reason = reason
+    plan.conflict_reason = f"预约取消联动: {reason}"
     plan.updated_at = now
-    plan.source_detail = plan.source_detail or f"预约发布取消: {reason}"
+    existing_source = plan.source_detail or ""
+    if "预约取消联动" not in existing_source:
+        plan.source_detail = (existing_source + " | " if existing_source else "") + f"预约取消联动(by={cancelled_by}): {reason}"
     plan.executed_at = None
     plan.expired_at = None
     plan.superseded_at = None
     plan.superseded_by_plan_id = None
+    result["action_taken"] = "cancelled"
+    result["new_status"] = models.PLAN_STATUS_CANCELLED
     _add_plan_event(db, plan.id, "cancelled", old_status, models.PLAN_STATUS_CANCELLED,
-                    cancelled_by, reason, {"cancel_reason": reason})
-    return plan.id
+                    cancelled_by, f"预约取消联动: {reason}",
+                    {"cancel_reason": reason, "scheduled_release_id": scheduled_release_id,
+                     "cancel_source": "scheduled_release_cancel", "triggered_by": cancelled_by,
+                     "plan_source_type": plan.source_type, "plan_type": plan.plan_type,
+                     "action_type": "scheduled_cancel_linked", "batch_id": plan.batch_id})
+    return result
 
 
 def handle_scheduler_execute_plan(db: Session, scheduled_release_id: int, release_version_id: int,

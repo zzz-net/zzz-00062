@@ -516,11 +516,65 @@ def cancel_candidate(
     db: Session = Depends(get_db),
     _=Depends(auth.require_role(auth.ALLOW_CANDIDATE_ROLES))
 ):
+    current_before = crud.get_current_candidate(db)
+    conflict_info_before = None
+    rule_id_for_check = None
+    if current_before:
+        rule_id_for_check = current_before.rule_id
+        conflict_info_before = crud.check_conflict_for_cancel_candidate(db, rule_id_for_check, operated_by)
+    else:
+        crud.write_audit_log(
+            db,
+            action="cancel_candidate",
+            operator=operated_by,
+            target_type="candidate",
+            target_id="none",
+            result="not_found",
+            detail=f"尝试取消候选但当前无候选存在, 原因: {reason or '手动取消候选'}",
+        )
+        raise HTTPException(status_code=404, detail="当前没有候选发布")
+
     result = crud.clear_candidate(db, reason=reason or "手动取消候选", operated_by=operated_by)
     if not result:
+        crud.write_audit_log(
+            db,
+            action="cancel_candidate",
+            operator=operated_by,
+            target_type="candidate",
+            target_id="none",
+            result="not_found",
+            detail=f"尝试取消候选但当前无候选存在(race), 原因: {reason or '手动取消候选'}",
+        )
         raise HTTPException(status_code=404, detail="当前没有候选发布")
-    old_candidate, change_log = result
-    conflict_info = crud.check_conflict_for_cancel_candidate(db, old_candidate.rule_id, operated_by)
+    old_candidate, change_log, plan_handle_result = result
+    conflict_info = conflict_info_before
+    audit_detail_parts = [
+        f"取消候选批次{old_candidate.batch_id}",
+        f"原因: {reason or '手动取消候选'}",
+    ]
+    if conflict_info.has_conflict:
+        audit_detail_parts.append(f"冲突命中: {conflict_info.conflict_reason}")
+        audit_detail_parts.append(f"建议动作: {conflict_info.suggestion or '联动取消'}")
+    if plan_handle_result:
+        audit_detail_parts.append(
+            f"计划联动处理: 总计={plan_handle_result.get('total_found', 0)}, "
+            f"成功取消={len(plan_handle_result.get('cancelled_ids', []))}, "
+            f"幂等跳过={len(plan_handle_result.get('skipped_ids', []))}, "
+            f"触发人={plan_handle_result.get('triggered_by', operated_by)}, "
+            f"动作类型={plan_handle_result.get('action', 'linked_cancel')}"
+        )
+        cancelled_ids = plan_handle_result.get("cancelled_ids", [])
+        skipped_ids = plan_handle_result.get("skipped_ids", [])
+        if cancelled_ids:
+            audit_detail_parts.append(f"已取消计划ID: {cancelled_ids}")
+        if skipped_ids:
+            audit_detail_parts.append(f"幂等跳过计划ID: {skipped_ids}")
+        for d in plan_handle_result.get("details", []):
+            audit_detail_parts.append(
+                f"  - plan#{d.get('plan_id')}: action={d.get('action')}, "
+                f"type={d.get('plan_type')}, source={d.get('source_type')}"
+                + (f", old_status={d.get('old_status')}->new_status={d.get('new_status')}" if d.get("old_status") else "")
+            )
     crud.write_audit_log(
         db,
         action="cancel_candidate",
@@ -528,12 +582,25 @@ def cancel_candidate(
         target_type="candidate",
         target_id=str(old_candidate.id),
         result="success",
-        detail=f"取消候选批次{old_candidate.batch_id}, 原因: {reason or '手动取消候选'}"
-               + (f", 冲突: {conflict_info.conflict_reason}" if conflict_info.has_conflict else ""),
+        detail=" | ".join(audit_detail_parts),
     )
     return {
         "candidate": schemas.ReleaseCandidateResponse.model_validate(old_candidate).model_dump(),
         "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump(),
+        "conflict_info": {
+            "has_conflict": conflict_info.has_conflict,
+            "conflict_type": conflict_info.conflict_type,
+            "conflict_plan_id": conflict_info.conflict_plan_id,
+            "conflict_reason": conflict_info.conflict_reason,
+            "suggestion": conflict_info.suggestion,
+        } if conflict_info else {"has_conflict": False},
+        "plan_linked_result": plan_handle_result or {
+            "cancelled_ids": [],
+            "skipped_ids": [],
+            "total_found": 0,
+            "action": "none",
+            "details": [],
+        },
     }
 
 
@@ -631,10 +698,50 @@ def cancel_scheduled_release(
     db: Session = Depends(get_db),
     _=Depends(auth.require_role(auth.ALLOW_CANDIDATE_ROLES)),
 ):
+    sched_before = crud.get_scheduled_release(db, sched_id)
+    if not sched_before:
+        crud.write_audit_log(
+            db,
+            action="cancel_scheduled_release",
+            operator=operated_by,
+            target_type="scheduled_release",
+            target_id=str(sched_id),
+            result="not_found",
+            detail=f"尝试取消预约但记录不存在, sched_id={sched_id}, 原因: {reason or '手动取消预约'}",
+        )
+        raise HTTPException(status_code=404, detail="预约发布记录不存在")
+    if sched_before.status not in ("pending",):
+        crud.write_audit_log(
+            db,
+            action="cancel_scheduled_release",
+            operator=operated_by,
+            target_type="scheduled_release",
+            target_id=str(sched_id),
+            result="rejected",
+            detail=f"取消预约被拒绝: 当前状态={sched_before.status}, 仅pending状态可取消, "
+                   f"批次={sched_before.batch_id}, 原因: {reason or '手动取消预约'}",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"预约状态为{sched_before.status}，不能取消（仅pending状态可取消）"
+        )
     try:
-        sched, change_log = crud.cancel_scheduled_release(
+        sched, change_log, plan_result = crud.cancel_scheduled_release(
             db, sched_id, reason=reason or "手动取消预约", operated_by=operated_by
         )
+        audit_parts = [
+            f"取消预约发布: 批次={sched.batch_id}",
+            f"sched_id={sched.id}",
+            f"原因: {reason or '手动取消预约'}",
+            f"状态: {sched_before.status}->{sched.status}",
+        ]
+        if plan_result:
+            audit_parts.append(
+                f"计划联动: action={plan_result.get('action_taken')}, "
+                f"plan_id={plan_result.get('plan_id')}, "
+                f"type={plan_result.get('plan_type')}, "
+                f"source={plan_result.get('source_type')}"
+            )
         crud.write_audit_log(
             db,
             action="cancel_scheduled_release",
@@ -642,7 +749,7 @@ def cancel_scheduled_release(
             target_type="scheduled_release",
             target_id=str(sched.id),
             result="success",
-            detail=f"取消预约发布: 批次={sched.batch_id}, 原因: {reason or '手动取消预约'}",
+            detail=" | ".join(audit_parts),
         )
         if change_log:
             crud.write_audit_log(
@@ -652,13 +759,24 @@ def cancel_scheduled_release(
                 target_type="candidate",
                 target_id=str(change_log.old_candidate_id),
                 result="success",
-                detail=f"取消候选(随预约取消): 原因={reason or '手动取消预约'}",
+                detail=f"取消候选(随预约取消联动): sched_id={sched.id}, "
+                       f"批次={sched.batch_id}, 原因={reason or '手动取消预约'}",
             )
         return {
             "scheduled_release": schemas.ScheduledReleaseResponse.model_validate(sched).model_dump(),
             "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump() if change_log else None,
+            "plan_linked_result": plan_result or {"plan_id": None, "action_taken": "none"},
         }
     except ValueError as e:
+        crud.write_audit_log(
+            db,
+            action="cancel_scheduled_release",
+            operator=operated_by,
+            target_type="scheduled_release",
+            target_id=str(sched_id),
+            result="rejected",
+            detail=f"取消预约失败: {str(e)}, 原因: {reason or '手动取消预约'}",
+        )
         raise HTTPException(status_code=400, detail=str(e))
 
 
