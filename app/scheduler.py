@@ -1,6 +1,6 @@
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from .database import SessionLocal
 from . import models, schemas, crud
@@ -49,12 +49,17 @@ class ScheduledReleaseScheduler:
     def _run_tick(self):
         db = SessionLocal()
         try:
+            try:
+                crud.expire_stale_plans(db)
+            except Exception:
+                pass
+
             now = datetime.utcnow()
             pending = crud.get_pending_scheduled_releases(db, before_time=now)
             for sched in pending:
                 if self._stop_event.is_set():
                     break
-                self._process_one(db, sched)
+                self._process_one(db, sched, now)
                 db.commit()
         except Exception as e:
             logger.exception(f"Unexpected scheduler error: {e}")
@@ -65,10 +70,45 @@ class ScheduledReleaseScheduler:
         finally:
             db.close()
 
-    def _process_one(self, db: Session, sched: models.ScheduledRelease):
+    def _process_one(self, db: Session, sched: models.ScheduledRelease, now: datetime):
         db.refresh(sched)
         if sched.status != "pending":
             return
+
+        try:
+            rule_id_val = sched.rule_id if sched.rule_id and sched.rule_id > 0 else None
+            early_seconds = crud.get_plan_config_int(db, "allow_early_window_seconds", rule_id_val, default=300)
+            late_seconds = crud.get_plan_config_int(db, "allow_late_window_seconds", rule_id_val, default=86400)
+
+            if sched.planned_time:
+                planned = sched.scheduled_time
+                earliest = planned - timedelta(seconds=early_seconds)
+                latest = planned + timedelta(seconds=late_seconds)
+
+                if now < earliest:
+                    return
+                if now > latest:
+                    conflict_reason = f"超出允许延后窗口{late_seconds}秒(当前{now.isoformat()}，窗口截止{latest.isoformat()})，自动失效"
+                    sched.status = "cancelled"
+                    sched.cancel_reason = conflict_reason
+                    sched.cancelled_at = datetime.utcnow()
+                    sched.cancelled_by = "__scheduler__"
+                    try:
+                        crud.handle_scheduler_conflict_cancel(db, sched.id, "__scheduler__", conflict_reason)
+                    except Exception:
+                        pass
+                    crud.write_audit_log(
+                        db,
+                        action="scheduled_release_conflict",
+                        operator="__scheduler__",
+                        target_type="scheduled_release",
+                        target_id=str(sched.id),
+                        result="cancelled",
+                        detail=conflict_reason,
+                    )
+                    return
+        except Exception:
+            pass
 
         candidate = db.query(models.ReleaseCandidate).filter(
             models.ReleaseCandidate.id == sched.candidate_id
@@ -91,6 +131,10 @@ class ScheduledReleaseScheduler:
             sched.cancel_reason = conflict_reason
             sched.cancelled_at = datetime.utcnow()
             sched.cancelled_by = "__scheduler__"
+            try:
+                crud.handle_scheduler_conflict_cancel(db, sched.id, "__scheduler__", conflict_reason)
+            except Exception:
+                pass
             crud.write_audit_log(
                 db,
                 action="scheduled_release_conflict",
@@ -129,6 +173,10 @@ class ScheduledReleaseScheduler:
             sched.cancel_reason = f"发布时校验失败: {ve}"
             sched.cancelled_at = datetime.utcnow()
             sched.cancelled_by = "__scheduler__"
+            try:
+                crud.handle_scheduler_execute_plan(db, sched.id, 0, False, "__scheduler__", str(ve))
+            except Exception:
+                pass
             crud.write_audit_log(
                 db,
                 action="scheduled_release_failed",

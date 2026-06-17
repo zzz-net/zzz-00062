@@ -217,6 +217,7 @@ class ExportResponse(BaseModel):
     candidate_batch_id: Optional[int] = None
     candidate_matches_active: Optional[bool] = None
     release_source: str = "manual"
+    plan_status: Optional[str] = None
 
 
 class ScheduleReleaseRequest(BaseModel):
@@ -251,3 +252,130 @@ class ScheduledReleaseResponse(BaseModel):
 class ScheduledReleaseDetailResponse(ScheduledReleaseResponse):
     candidate: Optional[ReleaseCandidateResponse] = None
     release_version: Optional[ReleaseVersionResponse] = None
+
+
+VALID_PLAN_STATUSES = {"queued", "scheduled", "executing", "executed", "expired", "superseded", "cancelled", "failed"}
+VALID_PLAN_SOURCE_TYPES = {"manual_candidate", "scheduled", "manual_release", "rollback", "import_conflict"}
+VALID_PLAN_TYPES = {"candidate", "release", "rollback"}
+
+
+class ReleasePlanConfigBase(BaseModel):
+    rule_id: Optional[int] = None
+    config_key: str
+    config_value: str
+    description: Optional[str] = ""
+
+
+class ReleasePlanConfigCreate(ReleasePlanConfigBase):
+    pass
+
+
+class ReleasePlanConfigUpdate(BaseModel):
+    config_value: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ReleasePlanConfigResponse(ReleasePlanConfigBase):
+    id: int
+    updated_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleasePlanEventResponse(BaseModel):
+    id: int
+    plan_id: int
+    event_type: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    operator: str
+    reason: str
+    detail: Dict[str, Any]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleasePlanBase(BaseModel):
+    rule_id: int
+    batch_id: Optional[int] = None
+    candidate_id: Optional[int] = None
+    scheduled_release_id: Optional[int] = None
+    release_version_id: Optional[int] = None
+    status: str
+    source_type: str
+    plan_type: str
+    planned_time: Optional[datetime] = None
+    conflict_reason: Optional[str] = ""
+    source_detail: Optional[str] = ""
+
+
+class ReleasePlanResponse(ReleasePlanBase):
+    id: int
+    executed_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+    superseded_at: Optional[datetime] = None
+    superseded_by_plan_id: Optional[int] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleasePlanDetailResponse(ReleasePlanResponse):
+    batch: Optional[SupplierBatchResponse] = None
+    candidate: Optional[ReleaseCandidateResponse] = None
+    scheduled_release: Optional[ScheduledReleaseResponse] = None
+    release_version: Optional[ReleaseVersionResponse] = None
+    events: List[ReleasePlanEventResponse] = []
+
+
+class ReleasePlanListQuery(BaseModel):
+    rule_id: Optional[int] = None
+    status: Optional[str] = None
+    source_type: Optional[str] = None
+    plan_type: Optional[str] = None
+    batch_id: Optional[int] = None
+    skip: int = 0
+    limit: int = 100
+
+
+class ReleasePlanStatsResponse(BaseModel):
+    rule_id: Optional[int] = None
+    queued_count: int = 0
+    scheduled_count: int = 0
+    executing_count: int = 0
+    executed_count: int = 0
+    expired_count: int = 0
+    superseded_count: int = 0
+    cancelled_count: int = 0
+    failed_count: int = 0
+    total_count: int = 0
+
+
+class ReleasePlanConflictInfo(BaseModel):
+    has_conflict: bool
+    conflict_type: Optional[str] = None
+    conflict_plan_id: Optional[int] = None
+    conflict_reason: Optional[str] = None
+    suggestion: Optional[str] = None
+
+
+class PlanConfigValidateRequest(BaseModel):
+    config_key: str
+    config_value: str
+
+
+class PlanConfigValidateResponse(BaseModel):
+    valid: bool
+    config_key: str
+    config_value: str
+    error_message: Optional[str] = None
+    normalized_value: Optional[str] = None

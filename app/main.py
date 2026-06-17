@@ -1,17 +1,38 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from contextlib import asynccontextmanager
-from .database import engine, Base, get_db
+from datetime import datetime, timedelta
+import logging
+from .database import engine, Base, get_db, SessionLocal
 from . import models, schemas, crud, auth
 from .scheduler import scheduler
+from .migrations import run_migrations, get_current_version
+from . import migrations as plan_migrations
+
+logger = logging.getLogger("release_plan_main")
 
 Base.metadata.create_all(bind=engine)
 
 
+def _run_startup_tasks():
+    db = SessionLocal()
+    try:
+        run_migrations(db)
+        recover_stats = crud.recover_plans_on_restart(db)
+        logger.info(f"Plan recovery on restart: {recover_stats}")
+        schema_ver = get_current_version(db)
+        logger.info(f"Schema version after migration: {schema_ver}")
+    except Exception as e:
+        logger.exception(f"Startup migration/recovery error: {e}")
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _run_startup_tasks()
     scheduler.start()
     yield
     scheduler.stop()
@@ -384,7 +405,13 @@ def export_active(
     if not result:
         raise HTTPException(status_code=404, detail="当前没有活动版本")
 
-    release, scores, candidate_batch_id, candidate_matches_active, release_source = result
+    if len(result) == 5:
+        release, scores, candidate_batch_id, candidate_matches_active, release_source = result
+        source_plan_detail = ""
+        plan_status = None
+    else:
+        release, scores, candidate_batch_id, candidate_matches_active, release_source, source_plan_detail, plan_status = result
+
     score_items = [
         schemas.ExportResultItem(
             supplier_code=s.supplier_code,
@@ -395,6 +422,10 @@ def export_active(
         ) for s in scores
     ]
 
+    release_source_display = release_source or "manual"
+    if False and source_plan_detail and plan_status:  # 保留release_source纯净值，兼容性优先
+        release_source_display = f"{release_source_display}|status={plan_status}"
+
     return schemas.ExportResponse(
         version=release.version,
         released_at=release.released_at,
@@ -404,7 +435,8 @@ def export_active(
         scores=score_items,
         candidate_batch_id=candidate_batch_id,
         candidate_matches_active=candidate_matches_active,
-        release_source=release_source or "manual",
+        release_source=release_source_display,
+        plan_status=plan_status,
     )
 
 
@@ -674,3 +706,237 @@ def get_latest_schedule_for_rule(
     if not sched:
         raise HTTPException(status_code=404, detail="该规则没有预约发布记录")
     return sched
+
+
+@app.get("/api/_meta/schema-version")
+def get_schema_version_endpoint(
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    return {
+        "schema_version": plan_migrations.get_current_version(db),
+        "target_version": plan_migrations.CURRENT_SCHEMA_VERSION,
+    }
+
+
+@app.get("/api/release-plans", response_model=List[schemas.ReleasePlanResponse])
+def list_release_plans(
+    rule_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None),
+    source_type: Optional[str] = Query(None),
+    plan_type: Optional[str] = Query(None),
+    batch_id: Optional[int] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    if status and status not in schemas.VALID_PLAN_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效状态: {status}。允许值: {', '.join(sorted(schemas.VALID_PLAN_STATUSES))}"
+        )
+    if source_type and source_type not in schemas.VALID_PLAN_SOURCE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效来源类型: {source_type}。允许值: {', '.join(sorted(schemas.VALID_PLAN_SOURCE_TYPES))}"
+        )
+    if plan_type and plan_type not in schemas.VALID_PLAN_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效计划类型: {plan_type}。允许值: {', '.join(sorted(schemas.VALID_PLAN_TYPES))}"
+        )
+    return crud.list_plans(db, rule_id=rule_id, status=status, source_type=source_type,
+                           plan_type=plan_type, batch_id=batch_id, skip=skip, limit=limit)
+
+
+@app.get("/api/release-plans/{plan_id}", response_model=schemas.ReleasePlanDetailResponse)
+def get_release_plan_detail(
+    plan_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    plan = crud.get_plan_by_id(db, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="发布计划不存在")
+    events = crud.get_plan_events(db, plan_id, limit=200)
+    return schemas.ReleasePlanDetailResponse(
+        id=plan.id,
+        rule_id=plan.rule_id,
+        batch_id=plan.batch_id,
+        candidate_id=plan.candidate_id,
+        scheduled_release_id=plan.scheduled_release_id,
+        release_version_id=plan.release_version_id,
+        status=plan.status,
+        source_type=plan.source_type,
+        plan_type=plan.plan_type,
+        planned_time=plan.planned_time,
+        executed_at=plan.executed_at,
+        expired_at=plan.expired_at,
+        cancelled_at=plan.cancelled_at,
+        superseded_at=plan.superseded_at,
+        superseded_by_plan_id=plan.superseded_by_plan_id,
+        conflict_reason=plan.conflict_reason,
+        source_detail=plan.source_detail,
+        created_by=plan.created_by,
+        created_at=plan.created_at,
+        updated_at=plan.updated_at,
+        batch=schemas.SupplierBatchResponse.model_validate(plan.batch) if hasattr(plan, 'batch') and plan.batch else None,
+        candidate=schemas.ReleaseCandidateResponse.model_validate(plan.candidate) if hasattr(plan, 'candidate') and plan.candidate else None,
+        scheduled_release=schemas.ScheduledReleaseResponse.model_validate(plan.scheduled_release) if hasattr(plan, 'scheduled_release') and plan.scheduled_release else None,
+        release_version=schemas.ReleaseVersionResponse.model_validate(plan.release_version) if hasattr(plan, 'release_version') and plan.release_version else None,
+        events=[schemas.ReleasePlanEventResponse.model_validate(e) for e in events],
+    )
+
+
+@app.get("/api/release-plans/{plan_id}/events", response_model=List[schemas.ReleasePlanEventResponse])
+def get_release_plan_events(
+    plan_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    plan = crud.get_plan_by_id(db, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="发布计划不存在")
+    return crud.get_plan_events(db, plan_id, skip=skip, limit=limit)
+
+
+@app.get("/api/release-plans-stats", response_model=List[schemas.ReleasePlanStatsResponse])
+def get_release_plans_stats(
+    rule_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    if rule_id is not None:
+        return [crud.get_plan_stats(db, rule_id=rule_id)]
+    stats_all = crud.get_plan_stats(db, rule_id=None)
+    rule_ids = db.query(models.ReleasePlan.rule_id).distinct().all()
+    result = [stats_all]
+    for (rid,) in rule_ids:
+        if rid:
+            result.append(crud.get_plan_stats(db, rule_id=rid))
+    return result
+
+
+@app.get("/api/release-plan-configs", response_model=List[schemas.ReleasePlanConfigResponse])
+def list_release_plan_configs(
+    rule_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role([auth.ROLE_ADMIN])),
+):
+    return crud.list_plan_configs(db, rule_id=rule_id)
+
+
+@app.post("/api/release-plan-configs/validate", response_model=schemas.PlanConfigValidateResponse)
+def validate_release_plan_config(
+    req: schemas.PlanConfigValidateRequest,
+    _=Depends(auth.require_role([auth.ROLE_ADMIN])),
+):
+    valid, error, normalized = crud.validate_plan_config(req.config_key, req.config_value)
+    return schemas.PlanConfigValidateResponse(
+        valid=valid,
+        config_key=req.config_key,
+        config_value=req.config_value,
+        error_message=error if not valid else None,
+        normalized_value=normalized if valid else None,
+    )
+
+
+@app.put("/api/release-plan-configs", response_model=schemas.ReleasePlanConfigResponse)
+def update_release_plan_config(
+    config_key: str = Query(..., description="配置键名"),
+    config_value: str = Query(..., description="配置值"),
+    rule_id: Optional[int] = Query(None, description="规则ID，None表示全局配置"),
+    description: Optional[str] = Query("", description="配置说明"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role([auth.ROLE_ADMIN])),
+):
+    try:
+        cfg = crud.set_plan_config(
+            db, config_key=config_key, config_value=config_value,
+            updated_by=user.username, rule_id=rule_id, description=description,
+        )
+        crud.write_audit_log(
+            db,
+            action="update_plan_config",
+            operator=user.username,
+            target_type="release_plan_config",
+            target_id=f"{rule_id}:{config_key}" if rule_id else f"global:{config_key}",
+            result="success",
+            detail=f"更新计划配置: {config_key}={config_value}" + (f" (rule_id={rule_id})" if rule_id else " (全局)"),
+        )
+        return cfg
+    except ValueError as e:
+        crud.write_audit_log(
+            db,
+            action="update_plan_config",
+            operator=user.username,
+            target_type="release_plan_config",
+            target_id=f"{rule_id}:{config_key}" if rule_id else f"global:{config_key}",
+            result="rejected",
+            detail=str(e),
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/release-plans/check-conflict/import")
+def check_conflict_import(
+    rule_id: int = Query(..., description="规则ID"),
+    new_batch_id: int = Query(..., description="新批次ID"),
+    imported_by: str = Query("admin", description="导入人"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    return crud.check_conflict_for_import(db, rule_id=rule_id, new_batch_id=new_batch_id, imported_by=imported_by)
+
+
+@app.get("/api/release-plans/check-conflict/manual-release")
+def check_conflict_manual_release(
+    rule_id: int = Query(..., description="规则ID"),
+    batch_id: int = Query(..., description="要发布的批次ID"),
+    released_by: str = Query("admin", description="发布人"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    return crud.check_conflict_for_manual_release(db, rule_id=rule_id, batch_id=batch_id, released_by=released_by)
+
+
+@app.get("/api/release-plans/check-conflict/cancel-candidate")
+def check_conflict_cancel_candidate(
+    rule_id: int = Query(..., description="规则ID"),
+    cancelled_by: str = Query("admin", description="取消人"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    return crud.check_conflict_for_cancel_candidate(db, rule_id=rule_id, cancelled_by=cancelled_by)
+
+
+@app.get("/api/release-plans/check-conflict/rollback")
+def check_conflict_rollback(
+    rule_id: int = Query(..., description="规则ID"),
+    target_version: str = Query(..., description="目标版本"),
+    operated_by: str = Query("admin", description="操作人"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.get_current_user),
+):
+    return crud.check_conflict_for_rollback(db, rule_id=rule_id, target_version=target_version, operated_by=operated_by)
+
+
+@app.post("/api/release-plans/trigger-expire", response_model=dict)
+def trigger_expire_stale_plans(
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role([auth.ROLE_ADMIN])),
+):
+    expired = crud.expire_stale_plans(db)
+    return {"expired_count": len(expired), "expired_plan_ids": expired}
+
+
+@app.post("/api/release-plans/recover", response_model=dict)
+def trigger_recover_plans(
+    db: Session = Depends(get_db),
+    _=Depends(auth.require_role([auth.ROLE_ADMIN])),
+):
+    stats = crud.recover_plans_on_restart(db)
+    return stats

@@ -178,3 +178,75 @@ class User(Base):
     username = Column(String(100), unique=True, nullable=False)
     role = Column(String(50), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+PLAN_STATUS_QUEUED = "queued"
+PLAN_STATUS_SCHEDULED = "scheduled"
+PLAN_STATUS_EXECUTING = "executing"
+PLAN_STATUS_EXECUTED = "executed"
+PLAN_STATUS_EXPIRED = "expired"
+PLAN_STATUS_SUPERSEDED = "superseded"
+PLAN_STATUS_CANCELLED = "cancelled"
+PLAN_STATUS_FAILED = "failed"
+
+PLAN_SOURCE_MANUAL_CANDIDATE = "manual_candidate"
+PLAN_SOURCE_SCHEDULED = "scheduled"
+PLAN_SOURCE_MANUAL_RELEASE = "manual_release"
+PLAN_SOURCE_ROLLBACK = "rollback"
+PLAN_SOURCE_IMPORT_CONFLICT = "import_conflict"
+
+PLAN_TYPE_CANDIDATE = "candidate"
+PLAN_TYPE_RELEASE = "release"
+PLAN_TYPE_ROLLBACK = "rollback"
+
+
+class ReleasePlanConfig(Base):
+    __tablename__ = "release_plan_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, nullable=True)
+    config_key = Column(String(100), nullable=False)
+    config_value = Column(Text, nullable=False)
+    description = Column(Text, default="")
+    updated_by = Column(String(100), default="__system__")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ReleasePlan(Base):
+    __tablename__ = "release_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, nullable=False, index=True)
+    batch_id = Column(Integer, nullable=True, index=True)
+    candidate_id = Column(Integer, nullable=True, index=True)
+    scheduled_release_id = Column(Integer, nullable=True, index=True)
+    release_version_id = Column(Integer, nullable=True, index=True)
+    status = Column(String(30), nullable=False, index=True)
+    source_type = Column(String(30), nullable=False)
+    plan_type = Column(String(30), nullable=False)
+    planned_time = Column(DateTime, nullable=True)
+    executed_at = Column(DateTime, nullable=True)
+    expired_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+    superseded_by_plan_id = Column(Integer, nullable=True)
+    conflict_reason = Column(Text, default="")
+    source_detail = Column(Text, default="")
+    created_by = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ReleasePlanEvent(Base):
+    __tablename__ = "release_plan_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    from_status = Column(String(30), nullable=True)
+    to_status = Column(String(30), nullable=True)
+    operator = Column(String(100), nullable=False)
+    reason = Column(Text, default="")
+    detail = Column(JSON, default={})
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
