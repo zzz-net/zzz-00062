@@ -8,7 +8,7 @@ from . import models
 logger = logging.getLogger("release_plan_migrations")
 
 MIGRATION_VERSION_TABLE = "_schema_migrations"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def ensure_migration_table(db: Session):
@@ -486,6 +486,186 @@ def migrate_v2_to_v3(db: Session):
     logger.info("Migration v2->v3 completed successfully")
 
 
+def migrate_v3_to_v4(db: Session):
+    logger.info("Starting migration v3 -> v4: Adding release_archives and release_archive_references")
+
+    if not table_exists(db, "release_archives"):
+        db.execute(text("""
+            CREATE TABLE release_archives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scheduled_release_id INTEGER NOT NULL,
+                release_plan_id INTEGER,
+                release_version_id INTEGER,
+                release_note TEXT NOT NULL DEFAULT '',
+                approval_remark TEXT NOT NULL DEFAULT '',
+                triggered_by VARCHAR(100) NOT NULL,
+                source_batch_id INTEGER NOT NULL,
+                target_version VARCHAR(50),
+                execution_strategy VARCHAR(20) NOT NULL DEFAULT 'auto',
+                snapshot_hash VARCHAR(64) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                conflict_result VARCHAR(30) NOT NULL DEFAULT 'none',
+                conflict_detail TEXT DEFAULT '',
+                is_immutable BOOLEAN NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                archived_at DATETIME NOT NULL,
+                last_processed_at DATETIME,
+                recovered_after_restart BOOLEAN DEFAULT 0,
+                processing_log JSON DEFAULT '[]',
+                reference_count INTEGER DEFAULT 0
+            )
+        """))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_scheduled ON release_archives(scheduled_release_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_plan ON release_archives(release_plan_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_version ON release_archives(release_version_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_batch ON release_archives(source_batch_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_status ON release_archives(status)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_hash ON release_archives(snapshot_hash)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_created ON release_archives(created_at DESC)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_archived ON release_archives(archived_at DESC)"))
+        logger.info("Created release_archives table")
+
+    if not table_exists(db, "release_archive_references"):
+        db.execute(text("""
+            CREATE TABLE release_archive_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_id INTEGER NOT NULL,
+                reference_type VARCHAR(50) NOT NULL,
+                reference_id VARCHAR(100) NOT NULL,
+                operation VARCHAR(50) NOT NULL,
+                operator VARCHAR(100) NOT NULL,
+                detail TEXT DEFAULT '',
+                created_at DATETIME NOT NULL
+            )
+        """))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_ref_archive ON release_archive_references(archive_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_ref_type ON release_archive_references(reference_type)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_ref_id ON release_archive_references(reference_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_archive_ref_created ON release_archive_references(created_at DESC)"))
+        logger.info("Created release_archive_references table")
+
+    db.commit()
+    backfill_release_archives(db)
+    record_migration(db, 4, "Add release_archives and release_archive_references tables for immutable snapshots")
+    logger.info("Migration v3->v4 completed successfully")
+
+
+def backfill_release_archives(db: Session):
+    logger.info("Backfilling release_archives from existing scheduled_releases...")
+    from sqlalchemy import text as sa_text
+    import hashlib
+    import json
+
+    existing_archives = db.execute(sa_text("SELECT COUNT(*) FROM release_archives")).fetchone()[0]
+    if existing_archives > 0:
+        logger.info(f"release_archives already has {existing_archives} records, skipping backfill")
+        return
+
+    sched_releases = db.execute(sa_text("""
+        SELECT sr.id, sr.batch_id, sr.candidate_id, sr.rule_id, sr.scheduled_time,
+               sr.status, sr.release_version_id, sr.created_by, sr.created_at,
+               rc.change_description, rc.operation_remark
+        FROM scheduled_releases sr
+        LEFT JOIN release_candidates rc ON sr.candidate_id = rc.id
+        ORDER BY sr.created_at ASC
+    """)).fetchall()
+
+    now = datetime.utcnow()
+    archive_id_counter = 1
+
+    for sr in sched_releases:
+        sr_id = sr[0]
+        batch_id = sr[1]
+        created_by = sr[7]
+        created_at = sr[8]
+        change_desc = sr[9] or ""
+        op_remark = sr[10] or ""
+        status = sr[5]
+        release_version_id = sr[6]
+
+        plan = db.execute(sa_text("""
+            SELECT id FROM release_plans WHERE scheduled_release_id = :srid ORDER BY id ASC LIMIT 1
+        """), {"srid": sr_id}).fetchone()
+        plan_id = plan[0] if plan else None
+
+        snapshot_data = {
+            "release_note": change_desc,
+            "approval_remark": op_remark,
+            "triggered_by": created_by or "__system__",
+            "source_batch_id": batch_id,
+            "target_version": None,
+            "execution_strategy": "auto",
+            "scheduled_release_id": sr_id,
+        }
+        snapshot_str = json.dumps(snapshot_data, sort_keys=True, ensure_ascii=False)
+        snapshot_hash = hashlib.sha256(snapshot_str.encode("utf-8")).hexdigest()
+
+        status_map = {
+            "pending": "pending",
+            "executed": "executed",
+            "cancelled": "cancelled",
+        }
+        archive_status = status_map.get(status, "pending")
+
+        if status == "cancelled" and ("顶替" in str(op_remark) or "导入" in str(op_remark) or "发布" in str(op_remark)):
+            archive_status = "superseded"
+
+        db.execute(sa_text("""
+            INSERT INTO release_archives (
+                id, scheduled_release_id, release_plan_id, release_version_id,
+                release_note, approval_remark, triggered_by, source_batch_id,
+                target_version, execution_strategy, snapshot_hash, status,
+                conflict_result, conflict_detail, is_immutable,
+                created_at, archived_at, last_processed_at,
+                recovered_after_restart, processing_log, reference_count
+            ) VALUES (
+                :id, :srid, :plan_id, :version_id,
+                :note, :remark, :triggered_by, :batch_id,
+                :target_ver, :exec_strategy, :hash, :status,
+                :conflict, :conflict_detail, 1,
+                :created, :archived, :last_processed,
+                0, '[]', 0
+            )
+        """), {
+            "id": archive_id_counter,
+            "srid": sr_id,
+            "plan_id": plan_id,
+            "version_id": release_version_id,
+            "note": change_desc,
+            "remark": op_remark,
+            "triggered_by": created_by or "__system__",
+            "batch_id": batch_id,
+            "target_ver": None,
+            "exec_strategy": "auto",
+            "hash": snapshot_hash,
+            "status": archive_status,
+            "conflict": "none",
+            "conflict_detail": "",
+            "created": created_at or now,
+            "archived": now,
+            "last_processed": created_at if archive_status in ("executed", "cancelled", "superseded") else None,
+        })
+
+        if plan_id:
+            db.execute(sa_text("""
+                INSERT INTO release_archive_references (
+                    archive_id, reference_type, reference_id, operation, operator, detail, created_at
+                ) VALUES (:aid, 'release_plan', :ref_id, 'backfill', '__system__', '历史数据迁移回填', :t)
+            """), {"aid": archive_id_counter, "ref_id": str(plan_id), "t": now})
+
+        if release_version_id:
+            db.execute(sa_text("""
+                INSERT INTO release_archive_references (
+                    archive_id, reference_type, reference_id, operation, operator, detail, created_at
+                ) VALUES (:aid, 'release_version', :ref_id, 'backfill', '__system__', '历史数据迁移回填', :t)
+            """), {"aid": archive_id_counter, "ref_id": str(release_version_id), "t": now})
+
+        archive_id_counter += 1
+
+    db.commit()
+    logger.info(f"Backfilled {len(sched_releases)} release archives")
+
+
 def run_migrations(db: Session):
     current = get_current_version(db)
     logger.info(f"Current schema version: {current}, target: {CURRENT_SCHEMA_VERSION}")
@@ -501,6 +681,10 @@ def run_migrations(db: Session):
     if current < 3:
         migrate_v2_to_v3(db)
         current = 3
+
+    if current < 4:
+        migrate_v3_to_v4(db)
+        current = 4
 
     try:
         repair_bad_plan_data(db)

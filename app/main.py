@@ -1067,3 +1067,413 @@ def trigger_recover_plans(
 ):
     stats = crud.recover_plans_on_restart(db)
     return stats
+
+
+@app.get("/api/release-archives", response_model=List[schemas.ReleaseArchiveResponse])
+def list_release_archives(
+    scheduled_release_id: Optional[int] = Query(None),
+    release_plan_id: Optional[int] = Query(None),
+    release_version_id: Optional[int] = Query(None),
+    source_batch_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None),
+    conflict_result: Optional[str] = Query(None),
+    triggered_by: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_VIEW_ROLES)),
+):
+    if status and status not in schemas.VALID_ARCHIVE_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效状态: {status}。允许值: {', '.join(sorted(schemas.VALID_ARCHIVE_STATUSES))}"
+        )
+    if conflict_result and conflict_result not in schemas.VALID_ARCHIVE_CONFLICTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效冲突结果: {conflict_result}。允许值: {', '.join(sorted(schemas.VALID_ARCHIVE_CONFLICTS))}"
+        )
+    archives = crud.list_archives(
+        db,
+        scheduled_release_id=scheduled_release_id,
+        release_plan_id=release_plan_id,
+        release_version_id=release_version_id,
+        source_batch_id=source_batch_id,
+        status=status,
+        conflict_result=conflict_result,
+        triggered_by=triggered_by,
+        skip=skip,
+        limit=limit,
+    )
+    return archives
+
+
+@app.get("/api/release-archives/{archive_id}", response_model=schemas.ReleaseArchiveDetailResponse)
+def get_release_archive_detail(
+    archive_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_VIEW_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, archive_id)
+    if not archive:
+        crud.write_audit_log(
+            db,
+            action="archive_view",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="not_found",
+            detail=f"查看档案失败: 档案不存在",
+        )
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    permission_ok, permission_msg = crud.check_archive_permission(
+        db, archive_id, user.username, auth.ALLOW_ARCHIVE_VIEW_ROLES, user.role, "view"
+    )
+    if not permission_ok:
+        crud.write_audit_log(
+            db,
+            action="archive_view",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="forbidden",
+            detail=f"查看档案被拒: {permission_msg}",
+        )
+        raise HTTPException(status_code=403, detail=permission_msg)
+
+    references = crud.get_archive_references(db, archive_id, limit=200)
+    processing_log = []
+    if isinstance(archive.processing_log, list):
+        processing_log = [schemas.ProcessingLogEntry(**log) for log in archive.processing_log]
+
+    crud.write_audit_log(
+        db,
+        action="archive_view",
+        operator=user.username,
+        target_type="release_archive",
+        target_id=str(archive_id),
+        result="success",
+        detail=f"查看档案详情，状态={archive.status}",
+    )
+
+    return schemas.ReleaseArchiveDetailResponse(
+        id=archive.id,
+        scheduled_release_id=archive.scheduled_release_id,
+        release_plan_id=archive.release_plan_id,
+        release_version_id=archive.release_version_id,
+        release_note=archive.release_note,
+        approval_remark=archive.approval_remark,
+        triggered_by=archive.triggered_by,
+        source_batch_id=archive.source_batch_id,
+        target_version=archive.target_version,
+        execution_strategy=archive.execution_strategy,
+        status=archive.status,
+        conflict_result=archive.conflict_result,
+        conflict_detail=archive.conflict_detail,
+        snapshot_hash=archive.snapshot_hash,
+        is_immutable=archive.is_immutable,
+        created_at=archive.created_at,
+        archived_at=archive.archived_at,
+        last_processed_at=archive.last_processed_at,
+        recovered_after_restart=archive.recovered_after_restart,
+        processing_log=processing_log,
+        reference_count=archive.reference_count,
+        scheduled_release=schemas.ScheduledReleaseResponse.model_validate(archive.scheduled_release) if archive.scheduled_release else None,
+        release_plan=schemas.ReleasePlanResponse.model_validate(archive.release_plan) if archive.release_plan else None,
+        release_version=schemas.ReleaseVersionResponse.model_validate(archive.release_version) if archive.release_version else None,
+        references=[schemas.ReleaseArchiveReferenceResponse.model_validate(ref) for ref in references],
+    )
+
+
+@app.get("/api/release-archives/{archive_id}/export", response_model=schemas.ReleaseArchiveExportResponse)
+def export_release_archive(
+    archive_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_EXPORT_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, archive_id)
+    if not archive:
+        crud.write_audit_log(
+            db,
+            action="archive_export",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="not_found",
+            detail=f"导出档案失败: 档案不存在",
+        )
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    permission_ok, permission_msg = crud.check_archive_permission(
+        db, archive_id, user.username, auth.ALLOW_ARCHIVE_EXPORT_ROLES, user.role, "export"
+    )
+    if not permission_ok:
+        crud.write_audit_log(
+            db,
+            action="archive_export",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="forbidden",
+            detail=f"导出档案被拒: {permission_msg}",
+        )
+        raise HTTPException(status_code=403, detail=permission_msg)
+
+    result = crud.export_archive(db, archive_id, user.username)
+    if not result:
+        raise HTTPException(status_code=500, detail="导出失败")
+
+    crud.write_audit_log(
+        db,
+        action="archive_export",
+        operator=user.username,
+        target_type="release_archive",
+        target_id=str(archive_id),
+        result="success",
+        detail=f"导出档案，hash={archive.snapshot_hash[:16]}...",
+    )
+
+    export_items = [schemas.ReleaseArchiveExportItem(**item) for item in result["items"]]
+    return schemas.ReleaseArchiveExportResponse(
+        archive_id=result["archive_id"],
+        snapshot_hash=result["snapshot_hash"],
+        export_time=result["export_time"],
+        exported_by=result["exported_by"],
+        items=export_items,
+        scheduled_release=schemas.ScheduledReleaseResponse.model_validate(result["scheduled_release"]) if result["scheduled_release"] else None,
+        release_version=schemas.ReleaseVersionResponse.model_validate(result["release_version"]) if result["release_version"] else None,
+    )
+
+
+@app.get("/api/release-archives/{archive_id}/audit-trail")
+def get_archive_audit_trail(
+    archive_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_AUDIT_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, archive_id)
+    if not archive:
+        crud.write_audit_log(
+            db,
+            action="archive_audit",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="not_found",
+            detail=f"审计档案失败: 档案不存在",
+        )
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    permission_ok, permission_msg = crud.check_archive_permission(
+        db, archive_id, user.username, auth.ALLOW_ARCHIVE_AUDIT_ROLES, user.role, "audit"
+    )
+    if not permission_ok:
+        crud.write_audit_log(
+            db,
+            action="archive_audit",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="forbidden",
+            detail=f"审计档案被拒: {permission_msg}",
+        )
+        raise HTTPException(status_code=403, detail=permission_msg)
+
+    trail = crud.get_archive_audit_trail(db, archive_id)
+    if not trail:
+        raise HTTPException(status_code=500, detail="获取审计链路失败")
+
+    verify_result = crud.verify_archive_snapshot(db, archive_id)
+    trail["snapshot_verified"] = verify_result["verified"]
+    trail["snapshot_hash_match"] = verify_result["verified"]
+
+    crud.write_audit_log(
+        db,
+        action="archive_audit",
+        operator=user.username,
+        target_type="release_archive",
+        target_id=str(archive_id),
+        result="success",
+        detail=f"查看审计链路，快照完整性={'验证通过' if verify_result['verified'] else '验证失败'}",
+    )
+
+    return trail
+
+
+@app.get("/api/release-archives/{archive_id}/verify")
+def verify_archive(
+    archive_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_AUDIT_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, archive_id)
+    if not archive:
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    result = crud.verify_archive_snapshot(db, archive_id)
+
+    crud.write_audit_log(
+        db,
+        action="archive_verify",
+        operator=user.username,
+        target_type="release_archive",
+        target_id=str(archive_id),
+        result="success" if result["verified"] else "failed",
+        detail=f"快照完整性校验，结果={'通过' if result['verified'] else '失败'}",
+    )
+
+    return result
+
+
+@app.post("/api/release-archives/verify-fields", response_model=schemas.ReleaseArchiveVerifyResponse)
+def verify_archive_fields(
+    req: schemas.ReleaseArchiveVerifyRequest,
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_AUDIT_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, req.archive_id)
+    if not archive:
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    snapshot_result = crud.verify_archive_snapshot(db, req.archive_id)
+
+    matched_fields = []
+    mismatched_fields = []
+    details = {
+        "snapshot_verified": snapshot_result["verified"],
+        "field_comparison": {},
+    }
+
+    snapshot_field_map = {
+        "release_note": archive.release_note,
+        "approval_remark": archive.approval_remark,
+        "triggered_by": archive.triggered_by,
+        "source_batch_id": archive.source_batch_id,
+        "target_version": archive.target_version,
+        "execution_strategy": archive.execution_strategy,
+        "scheduled_release_id": archive.scheduled_release_id,
+    }
+
+    for field, expected_value in req.expected_fields.items():
+        actual_value = snapshot_field_map.get(field)
+        match = str(actual_value) == str(expected_value)
+        if match:
+            matched_fields.append(field)
+        else:
+            mismatched_fields.append(field)
+        details["field_comparison"][field] = {
+            "expected": expected_value,
+            "actual": actual_value,
+            "match": match,
+            "is_snapshot_field": field in snapshot_field_map,
+        }
+
+    all_matched = len(mismatched_fields) == 0 and snapshot_result["verified"]
+
+    crud.write_audit_log(
+        db,
+        action="archive_verify_fields",
+        operator=user.username,
+        target_type="release_archive",
+        target_id=str(req.archive_id),
+        result="success" if all_matched else "mismatch",
+        detail=f"字段校验，匹配={len(matched_fields)}个，不匹配={len(mismatched_fields)}个",
+    )
+
+    return schemas.ReleaseArchiveVerifyResponse(
+        archive_id=req.archive_id,
+        verified=all_matched,
+        matched_fields=matched_fields,
+        mismatched_fields=mismatched_fields,
+        details=details,
+    )
+
+
+@app.post("/api/release-archives/{archive_id}/cancel", response_model=dict)
+def cancel_archive(
+    archive_id: int,
+    reason: str = Query(..., description="取消原因"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_CANCEL_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, archive_id)
+    if not archive:
+        crud.write_audit_log(
+            db,
+            action="archive_cancel",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="not_found",
+            detail=f"取消档案失败: 档案不存在",
+        )
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    permission_ok, permission_msg = crud.check_archive_permission(
+        db, archive_id, user.username, auth.ALLOW_ARCHIVE_CANCEL_ROLES, user.role, "cancel"
+    )
+    if not permission_ok:
+        crud.write_audit_log(
+            db,
+            action="archive_cancel",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="forbidden",
+            detail=f"取消档案被拒: {permission_msg}",
+        )
+        raise HTTPException(status_code=403, detail=permission_msg)
+
+    terminal_statuses = {models.ARCHIVE_STATUS_EXECUTED, models.ARCHIVE_STATUS_CANCELLED,
+                         models.ARCHIVE_STATUS_SUPERSEDED, models.ARCHIVE_STATUS_FAILED}
+    if archive.status in terminal_statuses:
+        crud.write_audit_log(
+            db,
+            action="archive_cancel",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="rejected",
+            detail=f"取消档案被拒: 已处于终态{archive.status}",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"档案已处于终态{archive.status}，不能取消"
+        )
+
+    if archive.scheduled_release_id:
+        sched = crud.get_scheduled_release(db, archive.scheduled_release_id)
+        if sched and sched.status == "pending":
+            crud.cancel_scheduled_release(db, archive.scheduled_release_id, reason, user.username)
+
+    updated = crud.update_archive_status(
+        db, archive_id, models.ARCHIVE_STATUS_CANCELLED, user.username,
+        conflict_result=models.ARCHIVE_CONFLICT_NONE,
+        conflict_detail=reason,
+    )
+
+    crud.write_audit_log(
+        db,
+        action="archive_cancel",
+        operator=user.username,
+        target_type="release_archive",
+        target_id=str(archive_id),
+        result="success",
+        detail=f"取消档案成功，原因: {reason}",
+    )
+
+    return {
+        "archive_id": archive_id,
+        "status": updated.status if updated else "cancelled",
+        "reason": reason,
+    }
+
+
+@app.get("/api/release-archives-stats")
+def get_archive_stats(
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_AUDIT_ROLES)),
+):
+    stats = crud.get_archive_stats(db)
+    return stats

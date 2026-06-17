@@ -250,3 +250,76 @@ class ReleasePlanEvent(Base):
     reason = Column(Text, default="")
     detail = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+ARCHIVE_STATUS_PENDING = "pending"
+ARCHIVE_STATUS_EXECUTING = "executing"
+ARCHIVE_STATUS_EXECUTED = "executed"
+ARCHIVE_STATUS_CANCELLED = "cancelled"
+ARCHIVE_STATUS_SUPERSEDED = "superseded"
+ARCHIVE_STATUS_FAILED = "failed"
+
+ARCHIVE_CONFLICT_NONE = "none"
+ARCHIVE_CONFLICT_IMPORT = "import_conflict"
+ARCHIVE_CONFLICT_MANUAL = "manual_release_conflict"
+ARCHIVE_CONFLICT_ROLLBACK = "rollback_conflict"
+ARCHIVE_CONFLICT_CANDIDATE = "candidate_conflict"
+
+ARCHIVE_EXEC_STRATEGY_AUTO = "auto"
+ARCHIVE_EXEC_STRATEGY_MANUAL = "manual"
+ARCHIVE_EXEC_STRATEGY_FORCE = "force"
+
+VALID_ARCHIVE_STATUSES = {ARCHIVE_STATUS_PENDING, ARCHIVE_STATUS_EXECUTING, ARCHIVE_STATUS_EXECUTED,
+                          ARCHIVE_STATUS_CANCELLED, ARCHIVE_STATUS_SUPERSEDED, ARCHIVE_STATUS_FAILED}
+VALID_ARCHIVE_CONFLICTS = {ARCHIVE_CONFLICT_NONE, ARCHIVE_CONFLICT_IMPORT, ARCHIVE_CONFLICT_MANUAL,
+                           ARCHIVE_CONFLICT_ROLLBACK, ARCHIVE_CONFLICT_CANDIDATE}
+VALID_ARCHIVE_EXEC_STRATEGIES = {ARCHIVE_EXEC_STRATEGY_AUTO, ARCHIVE_EXEC_STRATEGY_MANUAL, ARCHIVE_EXEC_STRATEGY_FORCE}
+
+
+class ReleaseArchive(Base):
+    __tablename__ = "release_archives"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scheduled_release_id = Column(Integer, ForeignKey("scheduled_releases.id"), nullable=False, index=True)
+    release_plan_id = Column(Integer, ForeignKey("release_plans.id"), nullable=True, index=True)
+    release_version_id = Column(Integer, ForeignKey("release_versions.id"), nullable=True, index=True)
+
+    release_note = Column(Text, nullable=False, default="")
+    approval_remark = Column(Text, nullable=False, default="")
+    triggered_by = Column(String(100), nullable=False)
+    source_batch_id = Column(Integer, nullable=False, index=True)
+    target_version = Column(String(50), nullable=True)
+    execution_strategy = Column(String(20), nullable=False, default=ARCHIVE_EXEC_STRATEGY_AUTO)
+
+    snapshot_hash = Column(String(64), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default=ARCHIVE_STATUS_PENDING, index=True)
+    conflict_result = Column(String(30), nullable=False, default=ARCHIVE_CONFLICT_NONE)
+    conflict_detail = Column(Text, default="")
+
+    is_immutable = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    archived_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_processed_at = Column(DateTime, nullable=True)
+    recovered_after_restart = Column(Boolean, default=False)
+
+    processing_log = Column(JSON, default=[])
+    reference_count = Column(Integer, default=0)
+
+    scheduled_release = relationship("ScheduledRelease")
+    release_plan = relationship("ReleasePlan")
+    release_version = relationship("ReleaseVersion")
+
+
+class ReleaseArchiveReference(Base):
+    __tablename__ = "release_archive_references"
+
+    id = Column(Integer, primary_key=True, index=True)
+    archive_id = Column(Integer, ForeignKey("release_archives.id"), nullable=False, index=True)
+    reference_type = Column(String(50), nullable=False, index=True)
+    reference_id = Column(String(100), nullable=False, index=True)
+    operation = Column(String(50), nullable=False)
+    operator = Column(String(100), nullable=False)
+    detail = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    archive = relationship("ReleaseArchive")

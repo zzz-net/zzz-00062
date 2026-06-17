@@ -379,3 +379,124 @@ class PlanConfigValidateResponse(BaseModel):
     config_value: str
     error_message: Optional[str] = None
     normalized_value: Optional[str] = None
+
+
+VALID_ARCHIVE_STATUSES = {"pending", "executing", "executed", "cancelled", "superseded", "failed"}
+VALID_ARCHIVE_CONFLICTS = {"none", "import_conflict", "manual_release_conflict", "rollback_conflict", "candidate_conflict"}
+VALID_ARCHIVE_EXEC_STRATEGIES = {"auto", "manual", "force"}
+
+
+class ProcessingLogEntry(BaseModel):
+    timestamp: str
+    event: str
+    operator: str
+    detail: Optional[str] = ""
+
+
+class ReleaseArchiveSnapshot(BaseModel):
+    release_note: str
+    approval_remark: str
+    triggered_by: str
+    source_batch_id: int
+    target_version: Optional[str] = None
+    execution_strategy: str = "auto"
+    scheduled_release_id: int
+
+
+class ReleaseArchiveBase(BaseModel):
+    scheduled_release_id: int
+    release_plan_id: Optional[int] = None
+    release_version_id: Optional[int] = None
+    release_note: str = ""
+    approval_remark: str = ""
+    triggered_by: str
+    source_batch_id: int
+    target_version: Optional[str] = None
+    execution_strategy: str = "auto"
+    status: str = "pending"
+    conflict_result: str = "none"
+    conflict_detail: Optional[str] = ""
+
+
+class ReleaseArchiveResponse(ReleaseArchiveBase):
+    id: int
+    snapshot_hash: str
+    is_immutable: bool
+    created_at: datetime
+    archived_at: datetime
+    last_processed_at: Optional[datetime] = None
+    recovered_after_restart: bool
+    processing_log: List[ProcessingLogEntry] = []
+    reference_count: int
+
+    class Config:
+        from_attributes = True
+
+
+class ReleaseArchiveReferenceResponse(BaseModel):
+    id: int
+    archive_id: int
+    reference_type: str
+    reference_id: str
+    operation: str
+    operator: str
+    detail: Optional[str] = ""
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleaseArchiveDetailResponse(ReleaseArchiveResponse):
+    scheduled_release: Optional[ScheduledReleaseResponse] = None
+    release_plan: Optional[ReleasePlanResponse] = None
+    release_version: Optional[ReleaseVersionResponse] = None
+    references: List[ReleaseArchiveReferenceResponse] = []
+
+
+class ReleaseArchiveListQuery(BaseModel):
+    scheduled_release_id: Optional[int] = None
+    release_plan_id: Optional[int] = None
+    release_version_id: Optional[int] = None
+    source_batch_id: Optional[int] = None
+    status: Optional[str] = None
+    conflict_result: Optional[str] = None
+    triggered_by: Optional[str] = None
+    skip: int = 0
+    limit: int = 100
+
+
+class ReleaseArchiveExportItem(BaseModel):
+    field: str
+    value: str
+    is_snapshot: bool
+    description: str
+
+
+class ReleaseArchiveExportResponse(BaseModel):
+    archive_id: int
+    snapshot_hash: str
+    export_time: datetime
+    exported_by: str
+    items: List[ReleaseArchiveExportItem]
+    scheduled_release: Optional[ScheduledReleaseResponse] = None
+    release_version: Optional[ReleaseVersionResponse] = None
+
+
+class ReleaseArchiveVerifyRequest(BaseModel):
+    archive_id: int
+    expected_fields: Dict[str, Any]
+
+
+class ReleaseArchiveVerifyResponse(BaseModel):
+    archive_id: int
+    verified: bool
+    matched_fields: List[str]
+    mismatched_fields: List[str]
+    details: Dict[str, Any]
+
+
+try:
+    ReleaseArchiveDetailResponse.model_rebuild()
+except Exception:
+    pass

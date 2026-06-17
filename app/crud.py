@@ -337,8 +337,9 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
     db.add(sched)
     db.flush()
 
+    plan_result = None
     try:
-        handle_scheduled_release_plan(
+        plan_result = handle_scheduled_release_plan(
             db,
             rule_id=db_batch.rule_id,
             batch_id=req.batch_id,
@@ -349,6 +350,23 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
         )
     except Exception:
         pass
+
+    try:
+        archive = create_release_archive(
+            db,
+            scheduled_release_id=sched.id,
+            release_note=req.release_note or req.change_description or "",
+            approval_remark=req.approval_remark or req.operation_remark or "",
+            triggered_by=req.set_by,
+            source_batch_id=req.batch_id,
+            release_plan_id=plan_result[0].id if plan_result else None,
+            execution_strategy="auto",
+        )
+        _append_processing_log(db, archive, "created_with_scheduled", req.set_by,
+                               f"随预约发布创建档案，预约ID={sched.id}")
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"创建档案失败: {e}", exc_info=True)
 
     db.commit()
     db.refresh(new_candidate)
@@ -1019,6 +1037,21 @@ def handle_import_conflict(db: Session, rule_id: int, new_batch_id: int, importe
                     {"superseded_ids": superseded_ids, "skipped_ids": skipped_ids,
                      "superseded_count": len(superseded_ids), "skipped_count": len(skipped_ids)})
 
+    try:
+        for plan_id in superseded_ids:
+            plan = get_plan_by_id(db, plan_id)
+            if plan and plan.scheduled_release_id:
+                archive = get_archive_by_scheduled_release_id(db, plan.scheduled_release_id)
+                if archive:
+                    update_archive_status(
+                        db, archive.id, models.ARCHIVE_STATUS_SUPERSEDED, imported_by,
+                        conflict_result=models.ARCHIVE_CONFLICT_IMPORT,
+                        conflict_detail=f"导入同规则新批次{new_batch_id}，原预约被顶掉",
+                    )
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"更新档案状态失败(导入冲突): {e}", exc_info=True)
+
     return superseded_ids
 
 
@@ -1122,6 +1155,38 @@ def handle_manual_release_plan(db: Session, rule_id: int, batch_id: int, release
                     released_by, f"手动发布处理完成，顶掉{superseded_other}个其他计划",
                     {"superseded_other_count": superseded_other,
                      "other_active_total": len(other_active)})
+
+    try:
+        if result.batch_id:
+            sched = db.query(models.ScheduledRelease).filter(
+                models.ScheduledRelease.batch_id == result.batch_id,
+                models.ScheduledRelease.status == "pending"
+            ).first()
+            if sched:
+                archive = get_archive_by_scheduled_release_id(db, sched.id)
+                if archive:
+                    update_archive_status(
+                        db, archive.id, models.ARCHIVE_STATUS_EXECUTED, released_by,
+                        conflict_result=models.ARCHIVE_CONFLICT_MANUAL,
+                        conflict_detail=f"手动提前发布同批次{result.batch_id}，版本ID={release_version_id}",
+                        release_version_id=release_version_id,
+                    )
+                    _add_archive_reference(db, archive.id, "manual_release", str(release_version_id),
+                                            "archive_manual_executed", released_by,
+                                            f"手动提前发布，版本ID={release_version_id}")
+
+        for plan in other_active:
+            if plan.scheduled_release_id:
+                archive = get_archive_by_scheduled_release_id(db, plan.scheduled_release_id)
+                if archive:
+                    update_archive_status(
+                        db, archive.id, models.ARCHIVE_STATUS_SUPERSEDED, released_by,
+                        conflict_result=models.ARCHIVE_CONFLICT_MANUAL,
+                        conflict_detail=f"手动发布批次{batch_id}(版本ID={release_version_id})，不同批次计划被顶掉",
+                    )
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"更新档案状态失败(手动发布): {e}", exc_info=True)
 
     return result
 
@@ -1441,6 +1506,21 @@ def handle_cancel_scheduled_release_plan(db: Session, scheduled_release_id: int,
                      "cancel_source": "scheduled_release_cancel", "triggered_by": cancelled_by,
                      "plan_source_type": plan.source_type, "plan_type": plan.plan_type,
                      "action_type": "scheduled_cancel_linked", "batch_id": plan.batch_id})
+
+    try:
+        archive = get_archive_by_scheduled_release_id(db, scheduled_release_id)
+        if archive:
+            update_archive_status(
+                db, archive.id, models.ARCHIVE_STATUS_CANCELLED, cancelled_by,
+                conflict_result=models.ARCHIVE_CONFLICT_NONE,
+                conflict_detail=reason,
+            )
+            _add_archive_reference(db, archive.id, "manual_cancel", str(scheduled_release_id),
+                                    "archive_cancelled", cancelled_by, f"手动取消预约: {reason}")
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"更新档案状态失败(手动取消): {e}", exc_info=True)
+
     return result
 
 
@@ -1474,6 +1554,29 @@ def handle_scheduler_execute_plan(db: Session, scheduled_release_id: int, releas
         old_status, plan.status, operator, detail,
         {"release_version_id": release_version_id, "detail": detail, "success": success},
     )
+
+    try:
+        archive = get_archive_by_scheduled_release_id(db, scheduled_release_id)
+        if archive:
+            if success:
+                update_archive_status(
+                    db, archive.id, models.ARCHIVE_STATUS_EXECUTED, operator,
+                    conflict_result=models.ARCHIVE_CONFLICT_NONE,
+                    conflict_detail=f"预约自动执行成功，版本ID={release_version_id}",
+                    release_version_id=release_version_id,
+                )
+                _add_archive_reference(db, archive.id, "release_version", str(release_version_id),
+                                       "archive_executed", operator, f"预约执行成功，版本ID={release_version_id}")
+            else:
+                update_archive_status(
+                    db, archive.id, models.ARCHIVE_STATUS_FAILED, operator,
+                    conflict_result=models.ARCHIVE_CONFLICT_NONE,
+                    conflict_detail=f"预约执行失败: {detail}",
+                )
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"更新档案状态失败(执行): {e}", exc_info=True)
+
     return plan
 
 
@@ -1499,6 +1602,19 @@ def handle_scheduler_conflict_cancel(db: Session, scheduled_release_id: int, ope
     plan.expired_at = None
     _add_plan_event(db, plan.id, "scheduler_conflict", old_status, models.PLAN_STATUS_SUPERSEDED,
                     operator, reason, {"conflict_reason": reason})
+
+    try:
+        archive = get_archive_by_scheduled_release_id(db, scheduled_release_id)
+        if archive:
+            update_archive_status(
+                db, archive.id, models.ARCHIVE_STATUS_SUPERSEDED, operator,
+                conflict_result=models.ARCHIVE_CONFLICT_CANDIDATE,
+                conflict_detail=reason,
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"更新档案状态失败(调度冲突取消): {e}", exc_info=True)
+
     return plan
 
 
@@ -1607,6 +1723,13 @@ def recover_plans_on_restart(db: Session) -> dict:
     _repair_contradictory_plans(db)
 
     expire_stale_plans(db)
+
+    try:
+        archive_stats = recover_archives_on_restart(db)
+        stats["archives"] = archive_stats
+    except Exception as e:
+        import logging
+        logging.getLogger("archive").error(f"档案重启恢复失败: {e}", exc_info=True)
 
     scheduled_plans = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.status == models.PLAN_STATUS_SCHEDULED,
@@ -1717,3 +1840,541 @@ def _repair_contradictory_plans(db: Session):
     if repaired > 0:
         db.commit()
     return repaired
+
+
+import hashlib
+import json
+
+
+def calculate_snapshot_hash(
+    release_note: str,
+    approval_remark: str,
+    triggered_by: str,
+    source_batch_id: int,
+    scheduled_release_id: int,
+    target_version: str | None = None,
+    execution_strategy: str = "auto",
+) -> str:
+    snapshot_data = {
+        "release_note": release_note,
+        "approval_remark": approval_remark,
+        "triggered_by": triggered_by,
+        "source_batch_id": source_batch_id,
+        "target_version": target_version,
+        "execution_strategy": execution_strategy,
+        "scheduled_release_id": scheduled_release_id,
+    }
+    snapshot_str = json.dumps(snapshot_data, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(snapshot_str.encode("utf-8")).hexdigest()
+
+
+def create_release_archive(
+    db: Session,
+    scheduled_release_id: int,
+    release_note: str,
+    approval_remark: str,
+    triggered_by: str,
+    source_batch_id: int,
+    release_plan_id: int | None = None,
+    target_version: str | None = None,
+    execution_strategy: str = "auto",
+) -> models.ReleaseArchive:
+    existing = get_archive_by_scheduled_release_id(db, scheduled_release_id)
+    if existing:
+        _append_processing_log(db, existing, "create_skip_idempotent", triggered_by,
+                               f"幂等跳过: 预约{scheduled_release_id}的档案已存在(archive_id={existing.id})")
+        return existing
+
+    snapshot_hash = calculate_snapshot_hash(
+        release_note=release_note,
+        approval_remark=approval_remark,
+        triggered_by=triggered_by,
+        source_batch_id=source_batch_id,
+        scheduled_release_id=scheduled_release_id,
+        target_version=target_version,
+        execution_strategy=execution_strategy,
+    )
+
+    now = datetime.utcnow()
+    archive = models.ReleaseArchive(
+        scheduled_release_id=scheduled_release_id,
+        release_plan_id=release_plan_id,
+        release_note=release_note,
+        approval_remark=approval_remark,
+        triggered_by=triggered_by,
+        source_batch_id=source_batch_id,
+        target_version=target_version,
+        execution_strategy=execution_strategy,
+        snapshot_hash=snapshot_hash,
+        status=models.ARCHIVE_STATUS_PENDING,
+        conflict_result=models.ARCHIVE_CONFLICT_NONE,
+        conflict_detail="",
+        is_immutable=True,
+        created_at=now,
+        archived_at=now,
+        processing_log=[],
+        reference_count=0,
+    )
+    db.add(archive)
+    db.flush()
+
+    _append_processing_log(db, archive, "created", triggered_by,
+                           f"档案创建成功，snapshot_hash={snapshot_hash[:16]}...")
+
+    _add_archive_reference(db, archive.id, "scheduled_release", str(scheduled_release_id),
+                           "archive_created", triggered_by, "档案创建时关联预约发布")
+    if release_plan_id:
+        _add_archive_reference(db, archive.id, "release_plan", str(release_plan_id),
+                               "archive_created", triggered_by, "档案创建时关联发布计划")
+
+    return archive
+
+
+def get_archive_by_id(db: Session, archive_id: int) -> models.ReleaseArchive | None:
+    return db.query(models.ReleaseArchive).filter(models.ReleaseArchive.id == archive_id).first()
+
+
+def get_archive_by_scheduled_release_id(db: Session, scheduled_release_id: int) -> models.ReleaseArchive | None:
+    return db.query(models.ReleaseArchive).filter(
+        models.ReleaseArchive.scheduled_release_id == scheduled_release_id
+    ).first()
+
+
+def get_archive_by_release_plan_id(db: Session, release_plan_id: int) -> models.ReleaseArchive | None:
+    return db.query(models.ReleaseArchive).filter(
+        models.ReleaseArchive.release_plan_id == release_plan_id
+    ).first()
+
+
+def list_archives(
+    db: Session,
+    scheduled_release_id: int | None = None,
+    release_plan_id: int | None = None,
+    release_version_id: int | None = None,
+    source_batch_id: int | None = None,
+    status: str | None = None,
+    conflict_result: str | None = None,
+    triggered_by: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[models.ReleaseArchive]:
+    q = db.query(models.ReleaseArchive)
+    if scheduled_release_id is not None:
+        q = q.filter(models.ReleaseArchive.scheduled_release_id == scheduled_release_id)
+    if release_plan_id is not None:
+        q = q.filter(models.ReleaseArchive.release_plan_id == release_plan_id)
+    if release_version_id is not None:
+        q = q.filter(models.ReleaseArchive.release_version_id == release_version_id)
+    if source_batch_id is not None:
+        q = q.filter(models.ReleaseArchive.source_batch_id == source_batch_id)
+    if status:
+        q = q.filter(models.ReleaseArchive.status == status)
+    if conflict_result:
+        q = q.filter(models.ReleaseArchive.conflict_result == conflict_result)
+    if triggered_by:
+        q = q.filter(models.ReleaseArchive.triggered_by == triggered_by)
+    return q.order_by(models.ReleaseArchive.archived_at.desc()).offset(skip).limit(limit).all()
+
+
+def _append_processing_log(
+    db: Session,
+    archive: models.ReleaseArchive,
+    event: str,
+    operator: str,
+    detail: str = "",
+) -> None:
+    if not isinstance(archive.processing_log, list):
+        archive.processing_log = []
+    new_logs = list(archive.processing_log)
+    new_logs.append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "event": event,
+        "operator": operator,
+        "detail": detail,
+    })
+    archive.processing_log = new_logs
+    archive.last_processed_at = datetime.utcnow()
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(archive, "processing_log")
+
+
+def _add_archive_reference(
+    db: Session,
+    archive_id: int,
+    reference_type: str,
+    reference_id: str,
+    operation: str,
+    operator: str,
+    detail: str = "",
+) -> models.ReleaseArchiveReference:
+    ref = models.ReleaseArchiveReference(
+        archive_id=archive_id,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        operation=operation,
+        operator=operator,
+        detail=detail,
+    )
+    db.add(ref)
+    archive = get_archive_by_id(db, archive_id)
+    if archive:
+        archive.reference_count = (archive.reference_count or 0) + 1
+    return ref
+
+
+def get_archive_references(
+    db: Session,
+    archive_id: int,
+    reference_type: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[models.ReleaseArchiveReference]:
+    q = db.query(models.ReleaseArchiveReference).filter(
+        models.ReleaseArchiveReference.archive_id == archive_id
+    )
+    if reference_type:
+        q = q.filter(models.ReleaseArchiveReference.reference_type == reference_type)
+    return q.order_by(models.ReleaseArchiveReference.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_archive_status(
+    db: Session,
+    archive_id: int,
+    new_status: str,
+    operator: str,
+    conflict_result: str | None = None,
+    conflict_detail: str = "",
+    release_version_id: int | None = None,
+) -> models.ReleaseArchive | None:
+    archive = get_archive_by_id(db, archive_id)
+    if not archive:
+        return None
+
+    if not archive.is_immutable:
+        _append_processing_log(db, archive, "update_skip_immutable", operator,
+                               f"档案标记为可变，跳过状态更新保护")
+
+    old_status = archive.status
+    if old_status == new_status and conflict_result is None and release_version_id is None:
+        _append_processing_log(db, archive, "update_skip_idempotent", operator,
+                               f"幂等跳过: 状态已为{new_status}")
+        return archive
+
+    terminal_statuses = {models.ARCHIVE_STATUS_EXECUTED, models.ARCHIVE_STATUS_CANCELLED,
+                         models.ARCHIVE_STATUS_SUPERSEDED, models.ARCHIVE_STATUS_FAILED}
+    if old_status in terminal_statuses and new_status not in terminal_statuses:
+        _append_processing_log(db, archive, "update_rejected_terminal", operator,
+                               f"拒绝从终态{old_status}转为{new_status}，保持不变")
+        return archive
+
+    if new_status not in models.VALID_ARCHIVE_STATUSES:
+        raise ValueError(f"无效档案状态: {new_status}")
+
+    if conflict_result and conflict_result not in models.VALID_ARCHIVE_CONFLICTS:
+        raise ValueError(f"无效冲突结果: {conflict_result}")
+
+    archive.status = new_status
+    if conflict_result:
+        archive.conflict_result = conflict_result
+    if conflict_detail:
+        archive.conflict_detail = conflict_detail
+    if release_version_id:
+        archive.release_version_id = release_version_id
+
+    _append_processing_log(db, archive, f"status_{old_status}_to_{new_status}", operator,
+                           f"状态变更: {old_status} -> {new_status}"
+                           + (f", 冲突: {conflict_result}" if conflict_result else "")
+                           + (f", 版本ID: {release_version_id}" if release_version_id else ""))
+
+    if new_status in terminal_statuses:
+        _add_archive_reference(db, archive_id, "status_terminal", f"final:{new_status}",
+                               f"archive_{new_status}", operator,
+                               f"档案进入终态: {new_status}")
+
+    return archive
+
+
+def verify_archive_snapshot(
+    db: Session,
+    archive_id: int,
+) -> dict:
+    archive = get_archive_by_id(db, archive_id)
+    if not archive:
+        return {"verified": False, "error": "档案不存在"}
+
+    expected_hash = calculate_snapshot_hash(
+        release_note=archive.release_note,
+        approval_remark=archive.approval_remark,
+        triggered_by=archive.triggered_by,
+        source_batch_id=archive.source_batch_id,
+        scheduled_release_id=archive.scheduled_release_id,
+        target_version=archive.target_version,
+        execution_strategy=archive.execution_strategy,
+    )
+
+    verified = expected_hash == archive.snapshot_hash
+    return {
+        "verified": verified,
+        "expected_hash": expected_hash,
+        "actual_hash": archive.snapshot_hash,
+        "is_immutable": archive.is_immutable,
+    }
+
+
+def export_archive(
+    db: Session,
+    archive_id: int,
+    exported_by: str,
+) -> dict | None:
+    archive = get_archive_by_id(db, archive_id)
+    if not archive:
+        return None
+
+    verify_result = verify_archive_snapshot(db, archive_id)
+
+    snapshot_fields = [
+        ("release_note", archive.release_note, "发布说明（快照）"),
+        ("approval_remark", archive.approval_remark, "审批备注（快照）"),
+        ("triggered_by", archive.triggered_by, "触发人（快照）"),
+        ("source_batch_id", str(archive.source_batch_id), "来源批次ID（快照）"),
+        ("target_version", archive.target_version or "", "目标版本（快照）"),
+        ("execution_strategy", archive.execution_strategy, "执行策略（快照）"),
+        ("scheduled_release_id", str(archive.scheduled_release_id), "关联预约ID（快照）"),
+        ("is_immutable", str(archive.is_immutable), "是否不可变（快照）"),
+    ]
+
+    runtime_fields = [
+        ("status", archive.status, "当前状态"),
+        ("conflict_result", archive.conflict_result, "冲突结果"),
+        ("conflict_detail", archive.conflict_detail, "冲突详情"),
+        ("snapshot_hash", archive.snapshot_hash, "快照哈希"),
+        ("created_at", archive.created_at.isoformat() if archive.created_at else "", "创建时间"),
+        ("archived_at", archive.archived_at.isoformat() if archive.archived_at else "", "归档时间"),
+        ("last_processed_at", archive.last_processed_at.isoformat() if archive.last_processed_at else "", "最后处理时间"),
+        ("recovered_after_restart", str(archive.recovered_after_restart), "重启后恢复标记"),
+        ("reference_count", str(archive.reference_count), "引用次数"),
+    ]
+
+    items = []
+    for field, value, description in snapshot_fields:
+        items.append({
+            "field": field,
+            "value": value,
+            "is_snapshot": True,
+            "description": description,
+        })
+
+    for field, value, description in runtime_fields:
+        items.append({
+            "field": field,
+            "value": value,
+            "is_snapshot": False,
+            "description": description,
+        })
+
+    _add_archive_reference(db, archive_id, "export", str(datetime.utcnow().timestamp()),
+                           "archive_exported", exported_by, "档案导出")
+    _append_processing_log(db, archive, "exported", exported_by, "档案被导出")
+
+    return {
+        "archive_id": archive_id,
+        "snapshot_hash": archive.snapshot_hash,
+        "export_time": datetime.utcnow(),
+        "exported_by": exported_by,
+        "items": items,
+        "scheduled_release": archive.scheduled_release,
+        "release_version": archive.release_version,
+        "snapshot_verified": verify_result["verified"],
+    }
+
+
+def get_archive_audit_trail(
+    db: Session,
+    archive_id: int,
+) -> dict | None:
+    archive = get_archive_by_id(db, archive_id)
+    if not archive:
+        return None
+
+    events = []
+    if isinstance(archive.processing_log, list):
+        events = list(archive.processing_log)
+
+    references = get_archive_references(db, archive_id)
+    reference_events = []
+    for ref in references:
+        reference_events.append({
+            "timestamp": ref.created_at.isoformat() if ref.created_at else "",
+            "event": f"reference:{ref.reference_type}",
+            "operator": ref.operator,
+            "detail": f"操作={ref.operation}, 引用ID={ref.reference_id}, 详情={ref.detail}",
+        })
+
+    plan_events = []
+    if archive.release_plan_id:
+        raw_plan_events = get_plan_events(db, archive.release_plan_id, limit=200)
+        for pe in raw_plan_events:
+            plan_events.append({
+                "timestamp": pe.created_at.isoformat() if pe.created_at else "",
+                "event": f"plan:{pe.event_type}",
+                "operator": pe.operator,
+                "detail": f"状态: {pe.from_status or ''} -> {pe.to_status or ''}, 原因={pe.reason}",
+            })
+
+    all_events = events + reference_events + plan_events
+    all_events.sort(key=lambda x: x.get("timestamp", ""))
+
+    return {
+        "archive_id": archive_id,
+        "snapshot_hash": archive.snapshot_hash,
+        "status": archive.status,
+        "conflict_result": archive.conflict_result,
+        "events": all_events,
+    }
+
+
+def recover_archives_on_restart(db: Session) -> dict:
+    stats = {
+        "recovered_pending": 0,
+        "recovered_executing": 0,
+        "aligned_executed": 0,
+        "aligned_cancelled": 0,
+        "aligned_superseded": 0,
+        "verified_intact": 0,
+        "verification_failed": 0,
+    }
+
+    archives = db.query(models.ReleaseArchive).filter(
+        models.ReleaseArchive.status.in_([
+            models.ARCHIVE_STATUS_PENDING,
+            models.ARCHIVE_STATUS_EXECUTING,
+        ])
+    ).all()
+
+    for archive in archives:
+        verify_result = verify_archive_snapshot(db, archive.id)
+        if verify_result["verified"]:
+            stats["verified_intact"] += 1
+        else:
+            stats["verification_failed"] += 1
+            _append_processing_log(db, archive, "verification_failed", "__system__",
+                                   f"重启校验失败: 快照哈希不匹配")
+
+        sched = db.query(models.ScheduledRelease).filter(
+            models.ScheduledRelease.id == archive.scheduled_release_id
+        ).first()
+
+        if not sched:
+            update_archive_status(
+                db, archive.id, models.ARCHIVE_STATUS_CANCELLED, "__system__",
+                conflict_result=models.ARCHIVE_CONFLICT_NONE,
+                conflict_detail="预约记录丢失，重启后自动取消",
+            )
+            stats["aligned_cancelled"] += 1
+            archive.recovered_after_restart = True
+            continue
+
+        if sched.status == "executed":
+            update_archive_status(
+                db, archive.id, models.ARCHIVE_STATUS_EXECUTED, "__system__",
+                release_version_id=sched.release_version_id,
+            )
+            stats["aligned_executed"] += 1
+            archive.recovered_after_restart = True
+        elif sched.status == "cancelled":
+            conflict_type = models.ARCHIVE_CONFLICT_NONE
+            if "顶替" in str(sched.cancel_reason) or "导入" in str(sched.cancel_reason):
+                conflict_type = models.ARCHIVE_CONFLICT_IMPORT
+            elif "发布" in str(sched.cancel_reason):
+                conflict_type = models.ARCHIVE_CONFLICT_MANUAL
+            update_archive_status(
+                db, archive.id, models.ARCHIVE_STATUS_CANCELLED, "__system__",
+                conflict_result=conflict_type,
+                conflict_detail=sched.cancel_reason or "重启后对齐预约已取消",
+            )
+            stats["aligned_cancelled"] += 1
+            archive.recovered_after_restart = True
+        elif sched.status == "pending":
+            if archive.status == models.ARCHIVE_STATUS_EXECUTING:
+                archive.status = models.ARCHIVE_STATUS_PENDING
+                _append_processing_log(db, archive, "recovered_from_executing", "__system__",
+                                       "重启后从executing恢复为pending")
+            archive.recovered_after_restart = True
+            stats["recovered_pending"] += 1
+            _append_processing_log(db, archive, "restart_recovered", "__system__",
+                                   "服务重启后恢复待执行状态")
+
+    db.commit()
+    return stats
+
+
+def link_archive_to_plan(
+    db: Session,
+    scheduled_release_id: int,
+    release_plan_id: int,
+    operator: str,
+) -> models.ReleaseArchive | None:
+    archive = get_archive_by_scheduled_release_id(db, scheduled_release_id)
+    if not archive:
+        return None
+
+    if archive.release_plan_id == release_plan_id:
+        _append_processing_log(db, archive, "link_plan_idempotent", operator,
+                               f"幂等跳过: 已关联计划{release_plan_id}")
+        return archive
+
+    archive.release_plan_id = release_plan_id
+    _add_archive_reference(db, archive.id, "release_plan", str(release_plan_id),
+                           "linked_to_plan", operator, f"关联到发布计划{release_plan_id}")
+    _append_processing_log(db, archive, "linked_to_plan", operator,
+                           f"关联到发布计划{release_plan_id}")
+
+    return archive
+
+
+def get_archive_stats(db: Session, rule_id: int | None = None) -> dict:
+    q = db.query(models.ReleaseArchive)
+    all_archives = q.all()
+
+    stats = {
+        "total": len(all_archives),
+        "pending": 0,
+        "executing": 0,
+        "executed": 0,
+        "cancelled": 0,
+        "superseded": 0,
+        "failed": 0,
+        "conflicts": 0,
+        "verified_intact": 0,
+    }
+
+    for a in all_archives:
+        key = a.status
+        if key in stats:
+            stats[key] += 1
+        if a.conflict_result != models.ARCHIVE_CONFLICT_NONE:
+            stats["conflicts"] += 1
+
+    return stats
+
+
+def check_archive_permission(
+    db: Session,
+    archive_id: int,
+    username: str,
+    required_roles: list[str],
+    user_role: str,
+    operation: str,
+) -> tuple[bool, str]:
+    archive = get_archive_by_id(db, archive_id)
+    if not archive:
+        return False, "档案不存在"
+
+    if user_role not in required_roles:
+        return False, f"权限不足，需要以下角色之一: {', '.join(required_roles)}，当前角色: {user_role}"
+
+    if archive.triggered_by != username and user_role not in ["admin"]:
+        if operation in ["cancel", "audit"]:
+            return False, f"仅创建人或管理员可{operation}该档案"
+
+    return True, ""
