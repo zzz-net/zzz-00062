@@ -55,7 +55,8 @@ class ScheduledReleaseScheduler:
                 pass
 
             now = datetime.utcnow()
-            pending = crud.get_pending_scheduled_releases(db, before_time=now)
+            max_early = crud.get_max_early_window_seconds(db, default=120)
+            pending = crud.get_pending_scheduled_releases(db, before_time=now, early_window_seconds=max_early)
             for sched in pending:
                 if self._stop_event.is_set():
                     break
@@ -77,36 +78,35 @@ class ScheduledReleaseScheduler:
 
         try:
             rule_id_val = sched.rule_id if sched.rule_id and sched.rule_id > 0 else None
-            early_seconds = crud.get_plan_config_int(db, "allow_early_window_seconds", rule_id_val, default=300)
+            early_seconds = crud.get_plan_config_int(db, "allow_early_window_seconds", rule_id_val, default=120)
             late_seconds = crud.get_plan_config_int(db, "allow_late_window_seconds", rule_id_val, default=86400)
 
-            if sched.planned_time:
-                planned = sched.scheduled_time
-                earliest = planned - timedelta(seconds=early_seconds)
-                latest = planned + timedelta(seconds=late_seconds)
+            planned = sched.scheduled_time
+            earliest = planned - timedelta(seconds=early_seconds)
+            latest = planned + timedelta(seconds=late_seconds)
 
-                if now < earliest:
-                    return
-                if now > latest:
-                    conflict_reason = f"超出允许延后窗口{late_seconds}秒(当前{now.isoformat()}，窗口截止{latest.isoformat()})，自动失效"
-                    sched.status = "cancelled"
-                    sched.cancel_reason = conflict_reason
-                    sched.cancelled_at = datetime.utcnow()
-                    sched.cancelled_by = "__scheduler__"
-                    try:
-                        crud.handle_scheduler_conflict_cancel(db, sched.id, "__scheduler__", conflict_reason)
-                    except Exception:
-                        pass
-                    crud.write_audit_log(
-                        db,
-                        action="scheduled_release_conflict",
-                        operator="__scheduler__",
-                        target_type="scheduled_release",
-                        target_id=str(sched.id),
-                        result="cancelled",
-                        detail=conflict_reason,
-                    )
-                    return
+            if now < earliest:
+                return
+            if now > latest:
+                conflict_reason = f"超出允许延后窗口{late_seconds}秒(当前{now.isoformat()}，窗口截止{latest.isoformat()})，自动失效"
+                sched.status = "cancelled"
+                sched.cancel_reason = conflict_reason
+                sched.cancelled_at = datetime.utcnow()
+                sched.cancelled_by = "__scheduler__"
+                try:
+                    crud.handle_scheduler_conflict_cancel(db, sched.id, "__scheduler__", conflict_reason)
+                except Exception:
+                    pass
+                crud.write_audit_log(
+                    db,
+                    action="scheduled_release_conflict",
+                    operator="__scheduler__",
+                    target_type="scheduled_release",
+                    target_id=str(sched.id),
+                    result="cancelled",
+                    detail=conflict_reason,
+                )
+                return
         except Exception:
             pass
 

@@ -164,6 +164,7 @@ def import_batch(
 ):
     try:
         result, cleared_candidate, change_log = crud.import_batch(db, batch_data)
+        conflict_info = crud.check_conflict_for_import(db, batch_data.rule_id, result.id, batch_data.imported_by)
         crud.write_audit_log(
             db,
             action="import_batch",
@@ -171,7 +172,8 @@ def import_batch(
             target_type="batch",
             target_id=str(result.id),
             result="success",
-            detail=f"导入批次: {batch_data.batch_name}, 供应商数: {len(batch_data.suppliers)}",
+            detail=f"导入批次: {batch_data.batch_name}, 供应商数: {len(batch_data.suppliers)}"
+                   + (f", 冲突: {conflict_info.conflict_reason}" if conflict_info.has_conflict else ""),
         )
         if cleared_candidate and change_log:
             crud.write_audit_log(
@@ -279,6 +281,7 @@ def approve_and_release(
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
     try:
+        conflict_info = crud.check_conflict_for_manual_release(db, batch.rule_id, batch_id, approve_data.approved_by)
         result = crud.approve_and_release(db, batch_id, approve_data)
         crud.write_audit_log(
             db,
@@ -287,7 +290,8 @@ def approve_and_release(
             target_type="version",
             target_id=result.version,
             result="success",
-            detail=f"发布批次 {batch_id} 为版本 {result.version}, 审批备注: {approve_data.approval_remark}",
+            detail=f"发布批次 {batch_id} 为版本 {result.version}, 审批备注: {approve_data.approval_remark}"
+                   + (f", 冲突: {conflict_info.conflict_reason}" if conflict_info.has_conflict else ""),
         )
         return result
     except ValueError as e:
@@ -516,6 +520,7 @@ def cancel_candidate(
     if not result:
         raise HTTPException(status_code=404, detail="当前没有候选发布")
     old_candidate, change_log = result
+    conflict_info = crud.check_conflict_for_cancel_candidate(db, old_candidate.rule_id, operated_by)
     crud.write_audit_log(
         db,
         action="cancel_candidate",
@@ -523,7 +528,8 @@ def cancel_candidate(
         target_type="candidate",
         target_id=str(old_candidate.id),
         result="success",
-        detail=f"取消候选批次{old_candidate.batch_id}, 原因: {reason or '手动取消候选'}",
+        detail=f"取消候选批次{old_candidate.batch_id}, 原因: {reason or '手动取消候选'}"
+               + (f", 冲突: {conflict_info.conflict_reason}" if conflict_info.has_conflict else ""),
     )
     return {
         "candidate": schemas.ReleaseCandidateResponse.model_validate(old_candidate).model_dump(),
@@ -677,6 +683,9 @@ def get_scheduled_release(
     sched = crud.get_scheduled_release(db, sched_id)
     if not sched:
         raise HTTPException(status_code=404, detail="预约发布记录不存在")
+    cancel_reason_out = ""
+    if sched.status == "cancelled":
+        cancel_reason_out = sched.cancel_reason
     return schemas.ScheduledReleaseDetailResponse(
         id=sched.id,
         candidate_id=sched.candidate_id,
@@ -684,13 +693,13 @@ def get_scheduled_release(
         rule_id=sched.rule_id,
         scheduled_time=sched.scheduled_time,
         status=sched.status,
-        cancel_reason=sched.cancel_reason,
+        cancel_reason=cancel_reason_out,
         release_version_id=sched.release_version_id,
         created_by=sched.created_by,
         created_at=sched.created_at,
         executed_at=sched.executed_at,
-        cancelled_at=sched.cancelled_at,
-        cancelled_by=sched.cancelled_by,
+        cancelled_at=sched.cancelled_at if sched.status == "cancelled" else None,
+        cancelled_by=sched.cancelled_by if sched.status == "cancelled" else None,
         candidate=schemas.ReleaseCandidateResponse.model_validate(sched.candidate) if sched.candidate else None,
         release_version=schemas.ReleaseVersionResponse.model_validate(sched.release_version) if sched.release_version else None,
     )

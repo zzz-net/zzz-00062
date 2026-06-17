@@ -8,7 +8,7 @@ from . import models
 logger = logging.getLogger("release_plan_migrations")
 
 MIGRATION_VERSION_TABLE = "_schema_migrations"
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def ensure_migration_table(db: Session):
@@ -405,7 +405,7 @@ def backfill_release_plans(db: Session):
 
 def backfill_default_configs(db: Session):
     defaults = [
-        (None, "allow_early_window_seconds", "300", "允许提前执行的时间窗口（秒），默认5分钟"),
+        (None, "allow_early_window_seconds", "120", "允许提前执行的时间窗口（秒），默认2分钟"),
         (None, "allow_late_window_seconds", "86400", "允许延后执行的时间窗口（秒），默认24小时，超出后自动失效"),
         (None, "default_expire_hours", "72", "排队候选的默认过期时间（小时），默认3天后失效"),
         (None, "max_queued_per_rule", "5", "同一规则最多排队的计划数量，超出自动顶掉最早的"),
@@ -426,6 +426,66 @@ def backfill_default_configs(db: Session):
     logger.info("Default release plan configs ensured")
 
 
+def migrate_v2_to_v3(db: Session):
+    logger.info("Starting migration v2 -> v3: Update early window default, repair contradictory plan data")
+
+    db.execute(text("""
+        UPDATE release_plan_configs
+        SET config_value = '120', description = '允许提前执行的时间窗口（秒），默认2分钟'
+        WHERE config_key = 'allow_early_window_seconds'
+          AND config_value = '300'
+          AND rule_id IS NULL
+          AND (description LIKE '%5分钟%' OR description LIKE '%300%')
+    """))
+    db.commit()
+    logger.info("Updated allow_early_window_seconds default from 300 to 120")
+
+    if table_exists(db, "release_plans"):
+        repaired = 0
+
+        db.execute(text("""
+            UPDATE release_plans SET cancelled_at = NULL
+            WHERE status = 'executed' AND cancelled_at IS NOT NULL
+        """))
+        repaired += db.execute(text("SELECT changes()")).fetchone()[0]
+
+        db.execute(text("""
+            UPDATE release_plans SET executed_at = NULL
+            WHERE status = 'cancelled' AND executed_at IS NOT NULL
+        """))
+        repaired += db.execute(text("SELECT changes()")).fetchone()[0]
+
+        db.execute(text("""
+            UPDATE release_plans SET executed_at = NULL
+            WHERE status = 'superseded' AND executed_at IS NOT NULL
+        """))
+        repaired += db.execute(text("SELECT changes()")).fetchone()[0]
+
+        db.execute(text("""
+            UPDATE release_plans SET executed_at = NULL
+            WHERE status = 'expired' AND executed_at IS NOT NULL
+        """))
+        repaired += db.execute(text("SELECT changes()")).fetchone()[0]
+
+        db.execute(text("""
+            UPDATE release_plans SET cancelled_at = NULL
+            WHERE status = 'superseded' AND cancelled_at IS NOT NULL
+        """))
+        repaired += db.execute(text("SELECT changes()")).fetchone()[0]
+
+        db.execute(text("""
+            UPDATE release_plans SET cancelled_at = NULL
+            WHERE status = 'expired' AND cancelled_at IS NOT NULL
+        """))
+        repaired += db.execute(text("SELECT changes()")).fetchone()[0]
+
+        db.commit()
+        logger.info(f"Repaired {repaired} contradictory plan records")
+
+    record_migration(db, 3, "Update early window default to 120s, repair contradictory plan timestamps")
+    logger.info("Migration v2->v3 completed successfully")
+
+
 def run_migrations(db: Session):
     current = get_current_version(db)
     logger.info(f"Current schema version: {current}, target: {CURRENT_SCHEMA_VERSION}")
@@ -437,6 +497,10 @@ def run_migrations(db: Session):
     if current < 2:
         migrate_v1_to_v2(db)
         current = 2
+
+    if current < 3:
+        migrate_v2_to_v3(db)
+        current = 3
 
     try:
         repair_bad_plan_data(db)

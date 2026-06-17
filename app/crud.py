@@ -422,10 +422,11 @@ def get_scheduled_release(db: Session, sched_id: int):
     return db.query(models.ScheduledRelease).filter(models.ScheduledRelease.id == sched_id).first()
 
 
-def get_pending_scheduled_releases(db: Session, before_time: datetime = None):
+def get_pending_scheduled_releases(db: Session, before_time: datetime = None, early_window_seconds: int = 0):
     q = db.query(models.ScheduledRelease).filter(models.ScheduledRelease.status == "pending")
     if before_time:
-        q = q.filter(models.ScheduledRelease.scheduled_time <= before_time)
+        effective_before = before_time + timedelta(seconds=early_window_seconds)
+        q = q.filter(models.ScheduledRelease.scheduled_time <= effective_before)
     return q.order_by(models.ScheduledRelease.scheduled_time.asc()).all()
 
 
@@ -796,6 +797,24 @@ def get_plan_config_int(db: Session, config_key: str, rule_id: int | None = None
         return default
 
 
+def get_max_early_window_seconds(db: Session, default: int = 120) -> int:
+    try:
+        rows = db.query(models.ReleasePlanConfig.config_value).filter(
+            models.ReleasePlanConfig.config_key == "allow_early_window_seconds"
+        ).all()
+        max_val = default
+        for row in rows:
+            try:
+                val = int(row.config_value)
+                if val > max_val:
+                    max_val = val
+            except (ValueError, TypeError):
+                pass
+        return max_val
+    except Exception:
+        return default
+
+
 def list_plan_configs(db: Session, rule_id: int | None = None) -> list[models.ReleasePlanConfig]:
     q = db.query(models.ReleasePlanConfig)
     if rule_id is None:
@@ -896,6 +915,9 @@ def _supersede_plan(db: Session, plan: models.ReleasePlan, superseder_id: int, o
     plan.superseded_by_plan_id = superseder_id
     plan.conflict_reason = reason
     plan.updated_at = now
+    plan.executed_at = None
+    plan.cancelled_at = None
+    plan.expired_at = None
     _add_plan_event(db, plan.id, "superseded", old_status, models.PLAN_STATUS_SUPERSEDED,
                     operator, reason, {"superseded_by_plan_id": superseder_id})
 
@@ -993,6 +1015,11 @@ def handle_manual_release_plan(db: Session, rule_id: int, batch_id: int, release
         existing.release_version_id = release_version_id
         existing.updated_at = now
         existing.conflict_reason = f"手动提前发布: {release_note}"
+        existing.source_detail = existing.source_detail or f"手动提前发布: {release_note}"
+        existing.cancelled_at = None
+        existing.expired_at = None
+        existing.superseded_at = None
+        existing.superseded_by_plan_id = None
         _add_plan_event(db, existing.id, "manual_release", old_status, models.PLAN_STATUS_EXECUTED,
                         released_by, f"手动提前发布，版本ID={release_version_id}",
                         {"release_version_id": release_version_id, "release_note": release_note})
@@ -1058,6 +1085,11 @@ def handle_cancel_candidate_plan(db: Session, rule_id: int, cancelled_by: str, r
         plan.cancelled_at = now
         plan.conflict_reason = reason
         plan.updated_at = now
+        plan.source_detail = plan.source_detail or f"手动取消候选: {reason}"
+        plan.executed_at = None
+        plan.expired_at = None
+        plan.superseded_at = None
+        plan.superseded_by_plan_id = None
         _add_plan_event(db, plan.id, "cancelled", old_status, models.PLAN_STATUS_CANCELLED,
                         cancelled_by, reason, {"cancel_reason": reason})
         cancelled_ids.append(plan.id)
@@ -1196,6 +1228,11 @@ def handle_cancel_scheduled_release_plan(db: Session, scheduled_release_id: int,
     plan.cancelled_at = now
     plan.conflict_reason = reason
     plan.updated_at = now
+    plan.source_detail = plan.source_detail or f"预约发布取消: {reason}"
+    plan.executed_at = None
+    plan.expired_at = None
+    plan.superseded_at = None
+    plan.superseded_by_plan_id = None
     _add_plan_event(db, plan.id, "cancelled", old_status, models.PLAN_STATUS_CANCELLED,
                     cancelled_by, reason, {"cancel_reason": reason})
     return plan.id
@@ -1216,9 +1253,14 @@ def handle_scheduler_execute_plan(db: Session, scheduled_release_id: int, releas
         plan.status = models.PLAN_STATUS_EXECUTED
         plan.executed_at = now
         plan.release_version_id = release_version_id
+        plan.cancelled_at = None
+        plan.expired_at = None
+        plan.superseded_at = None
+        plan.superseded_by_plan_id = None
     else:
         plan.status = models.PLAN_STATUS_FAILED
         plan.conflict_reason = f"执行失败: {detail}"
+        plan.source_detail = plan.source_detail or f"执行失败: {detail}"
     plan.updated_at = now
     _add_plan_event(
         db, plan.id,
@@ -1245,6 +1287,10 @@ def handle_scheduler_conflict_cancel(db: Session, scheduled_release_id: int, ope
     plan.superseded_at = now
     plan.conflict_reason = reason
     plan.updated_at = now
+    plan.source_detail = plan.source_detail or f"调度冲突取消: {reason}"
+    plan.executed_at = None
+    plan.cancelled_at = None
+    plan.expired_at = None
     _add_plan_event(db, plan.id, "scheduler_conflict", old_status, models.PLAN_STATUS_SUPERSEDED,
                     operator, reason, {"conflict_reason": reason})
     return plan
@@ -1268,6 +1314,10 @@ def expire_stale_plans(db: Session) -> list[int]:
             plan.expired_at = now
             plan.conflict_reason = f"排队超过{expire_hours}小时自动失效"
             plan.updated_at = now
+            plan.executed_at = None
+            plan.cancelled_at = None
+            plan.superseded_at = None
+            plan.superseded_by_plan_id = None
             _add_plan_event(db, plan.id, "auto_expired", old_status, models.PLAN_STATUS_EXPIRED,
                             "__scheduler__", f"排队超过{expire_hours}小时自动失效",
                             {"expire_hours": expire_hours})
@@ -1289,6 +1339,10 @@ def expire_stale_plans(db: Session) -> list[int]:
             plan.expired_at = now
             plan.conflict_reason = f"超过预约时间{late_seconds}秒未执行自动失效"
             plan.updated_at = now
+            plan.executed_at = None
+            plan.cancelled_at = None
+            plan.superseded_at = None
+            plan.superseded_by_plan_id = None
             _add_plan_event(db, plan.id, "auto_expired", old_status, models.PLAN_STATUS_EXPIRED,
                             "__scheduler__", f"超过预约窗口{late_seconds}秒自动失效",
                             {"allow_late_window_seconds": late_seconds})
@@ -1341,18 +1395,119 @@ def get_plan_events(db: Session, plan_id: int, skip: int = 0, limit: int = 200) 
 
 
 def recover_plans_on_restart(db: Session) -> dict:
-    stats = {"recovered_queued": 0, "recovered_scheduled": 0, "auto_expired": 0}
+    stats = {"recovered_queued": 0, "recovered_scheduled": 0, "auto_expired": 0,
+             "reconciled_executed": 0, "reconciled_cancelled": 0, "reconciled_superseded": 0}
+
+    _repair_contradictory_plans(db)
 
     expire_stale_plans(db)
+
+    scheduled_plans = db.query(models.ReleasePlan).filter(
+        models.ReleasePlan.status == models.PLAN_STATUS_SCHEDULED,
+        models.ReleasePlan.scheduled_release_id.isnot(None),
+    ).all()
+    for plan in scheduled_plans:
+        sched = db.query(models.ScheduledRelease).filter(
+            models.ScheduledRelease.id == plan.scheduled_release_id,
+        ).first()
+        if not sched:
+            now = datetime.utcnow()
+            old_status = plan.status
+            plan.status = models.PLAN_STATUS_EXPIRED
+            plan.expired_at = now
+            plan.conflict_reason = "预约记录丢失，自动失效"
+            plan.updated_at = now
+            plan.executed_at = None
+            plan.cancelled_at = None
+            plan.superseded_at = None
+            plan.superseded_by_plan_id = None
+            _add_plan_event(db, plan.id, "reconciled_expired", old_status, models.PLAN_STATUS_EXPIRED,
+                            "__system__", "预约记录丢失，自动失效", {})
+            stats["auto_expired"] += 1
+            continue
+        if sched.status == "executed":
+            now = datetime.utcnow()
+            old_status = plan.status
+            plan.status = models.PLAN_STATUS_EXECUTED
+            plan.executed_at = sched.executed_at or now
+            plan.release_version_id = sched.release_version_id
+            plan.updated_at = now
+            plan.cancelled_at = None
+            plan.expired_at = None
+            plan.superseded_at = None
+            plan.superseded_by_plan_id = None
+            plan.source_detail = plan.source_detail or f"重启后对齐: 预约已执行"
+            _add_plan_event(db, plan.id, "reconciled_executed", old_status, models.PLAN_STATUS_EXECUTED,
+                            "__system__", "重启后发现预约已执行，对齐计划状态",
+                            {"scheduled_release_id": sched.id})
+            stats["reconciled_executed"] += 1
+        elif sched.status == "cancelled":
+            now = datetime.utcnow()
+            old_status = plan.status
+            plan.status = models.PLAN_STATUS_CANCELLED
+            plan.cancelled_at = sched.cancelled_at or now
+            plan.conflict_reason = sched.cancel_reason or "预约已取消，重启后对齐"
+            plan.updated_at = now
+            plan.executed_at = None
+            plan.expired_at = None
+            plan.superseded_at = None
+            plan.superseded_by_plan_id = None
+            plan.source_detail = plan.source_detail or f"重启后对齐: 预约已取消"
+            _add_plan_event(db, plan.id, "reconciled_cancelled", old_status, models.PLAN_STATUS_CANCELLED,
+                            "__system__", "重启后发现预约已取消，对齐计划状态",
+                            {"scheduled_release_id": sched.id, "cancel_reason": sched.cancel_reason})
+            stats["reconciled_cancelled"] += 1
+
+    if stats["reconciled_executed"] + stats["reconciled_cancelled"] + stats["auto_expired"] > 0:
+        db.commit()
 
     queued = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.status == models.PLAN_STATUS_QUEUED,
     ).all()
     stats["recovered_queued"] = len(queued)
 
-    scheduled = db.query(models.ReleasePlan).filter(
+    remaining_scheduled = db.query(models.ReleasePlan).filter(
         models.ReleasePlan.status == models.PLAN_STATUS_SCHEDULED,
     ).all()
-    stats["recovered_scheduled"] = len(scheduled)
+    stats["recovered_scheduled"] = len(remaining_scheduled)
 
     return stats
+
+
+def _repair_contradictory_plans(db: Session):
+    repaired = 0
+    executed_with_cancel = db.query(models.ReleasePlan).filter(
+        models.ReleasePlan.status == models.PLAN_STATUS_EXECUTED,
+        models.ReleasePlan.cancelled_at.isnot(None),
+    ).all()
+    for plan in executed_with_cancel:
+        plan.cancelled_at = None
+        repaired += 1
+
+    cancelled_with_exec = db.query(models.ReleasePlan).filter(
+        models.ReleasePlan.status == models.PLAN_STATUS_CANCELLED,
+        models.ReleasePlan.executed_at.isnot(None),
+    ).all()
+    for plan in cancelled_with_exec:
+        plan.executed_at = None
+        repaired += 1
+
+    superseded_with_exec = db.query(models.ReleasePlan).filter(
+        models.ReleasePlan.status == models.PLAN_STATUS_SUPERSEDED,
+        models.ReleasePlan.executed_at.isnot(None),
+    ).all()
+    for plan in superseded_with_exec:
+        plan.executed_at = None
+        repaired += 1
+
+    expired_with_exec = db.query(models.ReleasePlan).filter(
+        models.ReleasePlan.status == models.PLAN_STATUS_EXPIRED,
+        models.ReleasePlan.executed_at.isnot(None),
+    ).all()
+    for plan in expired_with_exec:
+        plan.executed_at = None
+        repaired += 1
+
+    if repaired > 0:
+        db.commit()
+    return repaired
