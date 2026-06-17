@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from contextlib import asynccontextmanager
@@ -60,6 +61,30 @@ async def audit_permission_denial(request: Request, call_next):
         finally:
             db.close()
     return response
+
+
+@app.exception_handler(RequestValidationError)
+async def scheduled_time_validation_handler(request: Request, exc: RequestValidationError):
+    for err in exc.errors():
+        if "scheduled_time" in str(err.get("loc", [])):
+            msg = err.get("msg", "")
+            if "无效的时间格式" in msg or "预约时间" in msg:
+                username = request.headers.get("x-username", "anonymous")
+                db = SessionLocal()
+                try:
+                    crud.write_audit_log(
+                        db,
+                        action="create_scheduled_release",
+                        operator=username,
+                        target_type="scheduled_release",
+                        target_id="",
+                        result="rejected",
+                        detail=f"时间格式解析失败: {msg}",
+                    )
+                finally:
+                    db.close()
+                return JSONResponse(status_code=400, content={"detail": msg})
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 def init_default_data(db: Session):
@@ -1072,6 +1097,17 @@ def trigger_recover_plans(
     return stats
 
 
+@app.get("/api/release-archives/check-conflict/import", response_model=schemas.ReleaseArchiveImportConflictInfo)
+def check_archive_import_conflict(
+    rule_id: int = Query(..., description="规则ID"),
+    new_batch_id: int = Query(..., description="新批次ID"),
+    imported_by: str = Query("admin", description="导入人"),
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_VIEW_ROLES)),
+):
+    return crud.check_archive_import_conflict(db, rule_id=rule_id, new_batch_id=new_batch_id, imported_by=imported_by)
+
+
 @app.get("/api/release-archives", response_model=List[schemas.ReleaseArchiveResponse])
 def list_release_archives(
     scheduled_release_id: Optional[int] = Query(None),
@@ -1239,12 +1275,14 @@ def export_release_archive(
     )
 
     export_items = [schemas.ReleaseArchiveExportItem(**item) for item in result["items"]]
+    processing_log_entries = [schemas.ProcessingLogEntry(**log) for log in result.get("processing_log", [])]
     return schemas.ReleaseArchiveExportResponse(
         archive_id=result["archive_id"],
         snapshot_hash=result["snapshot_hash"],
         export_time=result["export_time"],
         exported_by=result["exported_by"],
         items=export_items,
+        processing_log=processing_log_entries,
         scheduled_release=schemas.ScheduledReleaseResponse.model_validate(result["scheduled_release"]) if result["scheduled_release"] else None,
         release_version=schemas.ReleaseVersionResponse.model_validate(result["release_version"]) if result["release_version"] else None,
     )

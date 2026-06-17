@@ -2223,6 +2223,7 @@ def export_archive(
         "export_time": datetime.utcnow(),
         "exported_by": exported_by,
         "items": items,
+        "processing_log": archive.processing_log if isinstance(archive.processing_log, list) else [],
         "scheduled_release": archive.scheduled_release,
         "release_version": archive.release_version,
         "snapshot_verified": verify_result["verified"],
@@ -2572,3 +2573,45 @@ def manually_execute_archive(
             detail=f"手动接管执行失败: {str(e)}",
         )
         raise
+
+
+def check_archive_import_conflict(
+    db: Session,
+    rule_id: int,
+    new_batch_id: int,
+    imported_by: str,
+) -> schemas.ReleaseArchiveImportConflictInfo:
+    pending_archives = db.query(models.ReleaseArchive).filter(
+        models.ReleaseArchive.status.in_([
+            models.ARCHIVE_STATUS_PENDING,
+            models.ARCHIVE_STATUS_EXECUTING,
+        ]),
+    ).all()
+
+    conflict_archives = []
+    for archive in pending_archives:
+        sched = db.query(models.ScheduledRelease).filter(
+            models.ScheduledRelease.id == archive.scheduled_release_id,
+        ).first()
+        if sched and sched.rule_id == rule_id:
+            conflict_archives.append({
+                "archive_id": archive.id,
+                "scheduled_release_id": archive.scheduled_release_id,
+                "source_batch_id": archive.source_batch_id,
+                "triggered_by": archive.triggered_by,
+                "target_version": archive.target_version,
+                "execution_strategy": archive.execution_strategy,
+                "scheduled_time": archive.scheduled_time.isoformat() if archive.scheduled_time else None,
+                "status": archive.status,
+                "snapshot_hash": archive.snapshot_hash,
+            })
+
+    if not conflict_archives:
+        return schemas.ReleaseArchiveImportConflictInfo(has_conflict=False)
+
+    return schemas.ReleaseArchiveImportConflictInfo(
+        has_conflict=True,
+        conflict_archives=conflict_archives,
+        conflict_reason=f"导入同规则(rule_id={rule_id})新批次{new_batch_id}，{len(conflict_archives)}条待执行档案将被标记为superseded",
+        suggestion=f"受影响档案ID: {[a['archive_id'] for a in conflict_archives]}，导入后将自动顶替",
+    )

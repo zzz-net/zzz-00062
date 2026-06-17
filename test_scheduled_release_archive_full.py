@@ -35,7 +35,6 @@ def get_default_rule_id():
 
 
 def setup_batch_and_calc(rule_id, ts):
-    """Import a batch with 2 suppliers, then calculate draft scores. Return batch_id."""
     suppliers = [
         {"supplier_code": f"S_ARC_{ts}_1", "supplier_name": f"ArchiveTest-A-{ts}",
          "metrics": {"delivery": 90.0, "quality": 85.0, "cost": 70.0, "innovation": 60.0}},
@@ -144,6 +143,17 @@ def test_1_timezone_input_and_fetch():
     assert_close_utc(detail3["scheduled_time"], planned_naive, tolerance_seconds=1)
     print(f"  [OK] create naive (as UTC), detail scheduled_time={detail3['scheduled_time']}")
 
+    # 1d) invalid time format -> 400 (not 500)
+    batch_id_4 = setup_batch_and_calc(rule_id, _ts() + "d")
+    r4 = post("/api/scheduled-releases", {
+        "batch_id": batch_id_4, "scheduled_time": "not-a-valid-time",
+        "target_version": "vTZ-4", "execution_strategy": "auto",
+        "change_description": "invalid time test", "set_by": "admin"
+    }, ADMIN_H)
+    assert r4.status_code in (400, 422), f"invalid time format should be 400 or 422, got {r4.status_code}"
+    assert r4.status_code != 500, f"invalid time format MUST NOT return 500!"
+    print(f"  [OK] invalid time format -> {r4.status_code} (not 500)")
+
     print("[PASS] Test 1: timezone input and fetch back\n")
     return archive_id, arch2, arch3
 
@@ -163,7 +173,6 @@ def test_2_snapshot_field_consistency():
     op = "Consistency test candidate op remark (MAY CHANGE LATER)"
 
     batch_id = setup_batch_and_calc(rule_id, _ts() + "c2")
-    # First set a candidate (so scheduled release finds one)
     post("/api/candidate/set", {
         "batch_id": batch_id, "change_description": cd,
         "operation_remark": op, "set_by": "admin",
@@ -198,7 +207,7 @@ def test_2_snapshot_field_consistency():
     assert by_field.get("scheduled_time"), "export snapshot missing scheduled_time"
     print(f"  [OK] export consistent: target_version={by_field['target_version']} execution_strategy={by_field['execution_strategy']}")
 
-    # 2c) modify candidate (via /api/candidate/set with another description) -> archive must stay unchanged
+    # 2c) modify candidate -> archive must stay unchanged
     post("/api/candidate/set", {
         "batch_id": batch_id,
         "change_description": "THIS SHOULD NOT APPEAR IN ARCHIVE SNAPSHOT",
@@ -316,12 +325,11 @@ def test_4_boundary_permission_and_idempotency():
     assert r_cancel2.status_code == 403, f"approver non-creator cancel should be 403, got {r_cancel2.status_code}"
     print(f"  [OK] approver (non-creator) cancel denied with 403")
 
-    # audit log: permission denials recorded (either forbidden in result, or any audit entries for this archive)
+    # audit log: permission denials recorded
     audit = get(f"/api/audit-logs", ADMIN_H, 200).json()
     forbidden = [a for a in audit
                  if str(a.get("target_id")) == str(arch_id) and a.get("result") == "forbidden"]
     related_any = [a for a in audit if str(a.get("target_id")) == str(arch_id)]
-    # permission denials are recorded - at least 3 HTTP 403 responses we verified, and audit logs exist
     assert len(related_any) > 0, f"no audit logs at all for archive {arch_id}"
     print(f"  [OK] audit: related entries={len(related_any)}, forbidden matches={len(forbidden)} "
           f"(all HTTP 403 responses verified above)")
@@ -351,7 +359,7 @@ def test_4_boundary_permission_and_idempotency():
     detail_cancelled = get(f"/api/release-archives/{archive_id_1}", ADMIN_H, 200).json()
     assert detail_cancelled["status"] == "cancelled", f"after cancel expected cancelled, got {detail_cancelled['status']}"
 
-    # second cancel on terminal archive -> should fail 400 with clear terminal-state message
+    # second cancel on terminal archive -> should fail 400
     r_2cancel = post(f"/api/release-archives/{archive_id_1}/cancel?reason=second%20cancel%20attempt",
                      None, ADMIN_H)
     assert r_2cancel.status_code == 400, f"second cancel on terminal should be 400, got {r_2cancel.status_code}"
@@ -370,8 +378,135 @@ def test_4_boundary_permission_and_idempotency():
     print("[PASS] Test 4: permission denial & idempotency boundaries\n")
 
 
+# ---------------------------------------------------------------------------
+# Test 5: import conflict identification via archive conflict check endpoint
+# ---------------------------------------------------------------------------
+def test_5_import_conflict_identification():
+    print("\n=== Test 5: import conflict identification ===")
+    rule_id = get_default_rule_id()
+
+    future = datetime.now(timezone.utc) + timedelta(days=10)
+    batch_id = setup_batch_and_calc(rule_id, _ts() + "ic1")
+    r = post("/api/scheduled-releases", {
+        "batch_id": batch_id, "scheduled_time": future.isoformat(),
+        "target_version": "vCONFLICT-1", "execution_strategy": "auto",
+        "change_description": "conflict test", "set_by": "admin",
+    }, ADMIN_H, expected=200)
+    arch_id = r.json()["release_archive_id"]
+    print(f"  created pending archive {arch_id} for rule {rule_id}")
+
+    # check conflict before importing new batch for same rule
+    r_check = get(f"/api/release-archives/check-conflict/import?rule_id={rule_id}&new_batch_id=99999&imported_by=admin",
+                  ADMIN_H, 200)
+    conflict_info = r_check.json()
+    assert conflict_info["has_conflict"] is True, f"expected has_conflict=True, got {conflict_info}"
+    assert len(conflict_info["conflict_archives"]) > 0, "expected at least one conflict archive"
+    found = any(a["archive_id"] == arch_id for a in conflict_info["conflict_archives"])
+    assert found, f"archive {arch_id} not found in conflict_archives: {conflict_info['conflict_archives']}"
+    conflict_arch = [a for a in conflict_info["conflict_archives"] if a["archive_id"] == arch_id][0]
+    assert conflict_arch["target_version"] == "vCONFLICT-1", f"conflict archive target_version mismatch"
+    assert conflict_arch["execution_strategy"] == "auto", f"conflict archive execution_strategy mismatch"
+    assert conflict_arch["status"] == "pending"
+    assert conflict_arch["snapshot_hash"], "conflict archive missing snapshot_hash"
+    print(f"  [OK] import conflict detected: archive_id={arch_id}, target_version={conflict_arch['target_version']}, "
+          f"execution_strategy={conflict_arch['execution_strategy']}, reason={conflict_info['conflict_reason'][:80]}")
+
+    # check conflict with a different rule -> should not conflict
+    other_rules = [r for r in get("/api/rules", ADMIN_H, 200).json() if r["id"] != rule_id]
+    if other_rules:
+        other_rule_id = other_rules[0]["id"]
+        r_check2 = get(f"/api/release-archives/check-conflict/import?rule_id={other_rule_id}&new_batch_id=99999&imported_by=admin",
+                       ADMIN_H, 200)
+        conflict_info2 = r_check2.json()
+        assert conflict_info2["has_conflict"] is False, f"other rule should have no archive conflict, got {conflict_info2}"
+        print(f"  [OK] different rule_id has no archive conflict")
+    else:
+        print(f"  [SKIP] only one rule exists, skipping cross-rule conflict check")
+
+    # user role should be able to view conflict check (ALLOW_ARCHIVE_VIEW_ROLES includes user)
+    r_check_user = get(f"/api/release-archives/check-conflict/import?rule_id={rule_id}&new_batch_id=99999&imported_by=admin",
+                       USER_H)
+    assert r_check_user.status_code == 200, f"user should be able to check archive import conflict, got {r_check_user.status_code}"
+    print(f"  [OK] user role can access archive import conflict check")
+
+    print("[PASS] Test 5: import conflict identification\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 6: export includes processing_log with status transitions
+# ---------------------------------------------------------------------------
+def test_6_export_includes_processing_log():
+    print("\n=== Test 6: export includes processing_log and status transitions ===")
+    rule_id = get_default_rule_id()
+
+    future = datetime.now(timezone.utc) + timedelta(hours=36)
+    batch_id = setup_batch_and_calc(rule_id, _ts() + "pl1")
+    r = post("/api/scheduled-releases", {
+        "batch_id": batch_id, "scheduled_time": future.isoformat(),
+        "target_version": "vPLOG-1", "execution_strategy": "manual",
+        "change_description": "processing log test", "operation_remark": "processing log op remark",
+        "release_note": "ProcessingLogTest release note", "approval_remark": "ProcessingLogTest approval remark",
+        "set_by": "admin",
+    }, ADMIN_H, expected=200)
+    arch_id = r.json()["release_archive_id"]
+
+    # trigger recover to add a recover event to processing_log
+    post("/api/release-plans/recover", None, ADMIN_H, expected=200)
+
+    # fetch export
+    exp = get(f"/api/release-archives/{arch_id}/export", ADMIN_H, 200).json()
+
+    # 6a) export has processing_log field
+    assert "processing_log" in exp, "export missing processing_log field"
+    plog = exp["processing_log"]
+    assert isinstance(plog, list) and len(plog) > 0, f"export processing_log should be non-empty list, got {plog}"
+    print(f"  [OK] export has processing_log with {len(plog)} entries")
+
+    # 6b) processing_log entries have required fields
+    for entry in plog:
+        assert "timestamp" in entry, f"processing_log entry missing 'timestamp': {entry}"
+        assert "event" in entry, f"processing_log entry missing 'event': {entry}"
+        assert "operator" in entry, f"processing_log entry missing 'operator': {entry}"
+    events = [e["event"] for e in plog]
+    print(f"  [OK] all processing_log entries have timestamp/event/operator, events={events}")
+
+    # 6c) created event should exist
+    has_created = any("created" in e.lower() for e in events)
+    assert has_created, f"no 'created' event in processing_log: {events}"
+    print(f"  [OK] processing_log contains 'created' event")
+
+    # 6d) recover event should exist (we triggered recover above)
+    has_recover = any("recover" in e.lower() for e in events)
+    assert has_recover, f"no 'recover' event in processing_log after recover: {events}"
+    print(f"  [OK] processing_log contains 'recover' event")
+
+    # 6e) snapshot fields in export match detail
+    detail = get(f"/api/release-archives/{arch_id}", ADMIN_H, 200).json()
+    by_field = {f["field"]: f["value"] for f in exp["items"]}
+    assert by_field["target_version"] == detail["target_version"], "export target_version != detail"
+    assert by_field["execution_strategy"] == detail["execution_strategy"], "export execution_strategy != detail"
+    assert by_field["release_note"] == detail["release_note"], "export release_note != detail"
+    assert by_field["approval_remark"] == detail["approval_remark"], "export approval_remark != detail"
+    assert by_field["triggered_by"] == detail["triggered_by"], "export triggered_by != detail"
+    assert by_field["source_batch_id"] == str(detail["source_batch_id"]), "export source_batch_id != detail"
+    print(f"  [OK] export snapshot fields fully consistent with detail endpoint")
+
+    # 6f) now cancel the archive and check processing_log has the cancel event
+    post(f"/api/release-archives/{arch_id}/cancel?reason=export%20log%20cancel%20test", None, ADMIN_H)
+    exp2 = get(f"/api/release-archives/{arch_id}/export", APPR_H, 200).json()
+    plog2 = exp2["processing_log"]
+    events2 = [e["event"] for e in plog2]
+    has_cancel = any("cancel" in e.lower() for e in events2)
+    assert has_cancel, f"no cancel event in processing_log after cancel: {events2}"
+    status_in_items = {f["field"]: f["value"] for f in exp2["items"] if f["field"] == "status"}
+    assert "status" in status_in_items, "export missing status field"
+    assert status_in_items["status"] == "cancelled", f"export status should be cancelled, got {status_in_items['status']}"
+    print(f"  [OK] after cancel: processing_log contains cancel event, export status=cancelled")
+
+    print("[PASS] Test 6: export includes processing_log and status transitions\n")
+
+
 def main():
-    # connectivity check via /docs
     try:
         r = requests.get(f"{BASE}/docs", timeout=5)
         assert r.status_code == 200, f"/docs returned {r.status_code}"
@@ -382,16 +517,18 @@ def main():
         sys.exit(1)
 
     print("=" * 72)
-    print("Scheduled Release Archive - Automation Test Suite (4 test groups)")
+    print("Scheduled Release Archive - Automation Test Suite (6 test groups)")
     print(f"Server: {BASE}")
     print("=" * 72)
 
     passed, failed = 0, 0
     tests = [
-        ("1. timezone input (+08:00 / Z / naive) create & fetch back", test_1_timezone_input_and_fetch),
+        ("1. timezone input (+08:00 / Z / naive / invalid) create & fetch back", test_1_timezone_input_and_fetch),
         ("2. target_version & execution_strategy consistency across detail/export", test_2_snapshot_field_consistency),
         ("3. pending archives survive after service-restart-like recover", test_3_restart_recovery),
         ("4. permission denials & terminal-state / idempotency boundaries", test_4_boundary_permission_and_idempotency),
+        ("5. import conflict identification via archive conflict check", test_5_import_conflict_identification),
+        ("6. export includes processing_log and status transitions", test_6_export_includes_processing_log),
     ]
 
     for name, fn in tests:

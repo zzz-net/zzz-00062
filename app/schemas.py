@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import List, Optional, Dict, Any, Union
+from datetime import datetime, timezone
 
 
 class ScoringRuleBase(BaseModel):
@@ -222,7 +222,7 @@ class ExportResponse(BaseModel):
 
 class ScheduleReleaseRequest(BaseModel):
     batch_id: int
-    scheduled_time: datetime
+    scheduled_time: Union[datetime, str]
     change_description: str = ""
     operation_remark: Optional[str] = ""
     release_note: Optional[str] = ""
@@ -230,6 +230,36 @@ class ScheduleReleaseRequest(BaseModel):
     target_version: Optional[str] = None
     execution_strategy: Optional[str] = "auto"
     set_by: str
+
+    @field_validator("scheduled_time", mode="before")
+    @classmethod
+    def _normalize_scheduled_time(cls, v):
+        if isinstance(v, datetime):
+            if v.tzinfo is not None:
+                v = v.astimezone(timezone.utc).replace(tzinfo=None)
+            return v
+        if not isinstance(v, str):
+            raise ValueError(f"无效的时间格式: {v!r}，需要ISO 8601字符串或datetime对象")
+        s = v.strip()
+        if not s:
+            raise ValueError("预约时间不能为空")
+        try:
+            dt = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z", "%Y/%m/%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(s, fmt)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+                else:
+                    raise ValueError(f"无效的时间格式: {s}，支持ISO 8601(带/不带时区)或YYYY-MM-DD HH:MM:SS格式")
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
 
 class ScheduledReleaseResponse(BaseModel):
@@ -483,6 +513,7 @@ class ReleaseArchiveExportResponse(BaseModel):
     export_time: datetime
     exported_by: str
     items: List[ReleaseArchiveExportItem]
+    processing_log: List[ProcessingLogEntry] = []
     scheduled_release: Optional[ScheduledReleaseResponse] = None
     release_version: Optional[ReleaseVersionResponse] = None
 
@@ -504,3 +535,10 @@ try:
     ReleaseArchiveDetailResponse.model_rebuild()
 except Exception:
     pass
+
+
+class ReleaseArchiveImportConflictInfo(BaseModel):
+    has_conflict: bool
+    conflict_archives: List[Dict[str, Any]] = []
+    conflict_reason: Optional[str] = None
+    suggestion: Optional[str] = None
