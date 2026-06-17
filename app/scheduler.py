@@ -147,10 +147,19 @@ class ScheduledReleaseScheduler:
             return
 
         try:
+            archive = crud.get_archive_by_scheduled_release_id(db, sched.id)
+            if archive:
+                approval_remark_val = archive.approval_remark or f"预约自动发布(快照)，原计划时间 {archive.scheduled_time.isoformat() if archive.scheduled_time else sched.scheduled_time.isoformat()}"
+                release_note_val = archive.release_note or f"预约自动生效发布(快照)"
+                approved_by_val = archive.triggered_by or sched.created_by
+            else:
+                approval_remark_val = candidate.operation_remark or f"预约自动发布，原计划时间 {sched.scheduled_time.isoformat()}"
+                release_note_val = candidate.change_description or f"预约自动生效发布"
+                approved_by_val = sched.created_by
             approve_data = schemas.ApproveRequest(
-                approved_by=sched.created_by,
-                approval_remark=candidate.operation_remark or f"预约自动发布，原计划时间 {sched.scheduled_time.isoformat()}",
-                release_note=candidate.change_description or f"预约自动生效发布",
+                approved_by=approved_by_val,
+                approval_remark=approval_remark_val,
+                release_note=release_note_val,
             )
             release = crud.approve_and_release(
                 db,

@@ -227,6 +227,8 @@ class ScheduleReleaseRequest(BaseModel):
     operation_remark: Optional[str] = ""
     release_note: Optional[str] = ""
     approval_remark: Optional[str] = ""
+    target_version: Optional[str] = None
+    execution_strategy: Optional[str] = "auto"
     set_by: str
 
 
@@ -401,6 +403,7 @@ class ReleaseArchiveSnapshot(BaseModel):
     target_version: Optional[str] = None
     execution_strategy: str = "auto"
     scheduled_release_id: int
+    scheduled_time: datetime
 
 
 class ReleaseArchiveBase(BaseModel):
@@ -413,6 +416,7 @@ class ReleaseArchiveBase(BaseModel):
     source_batch_id: int
     target_version: Optional[str] = None
     execution_strategy: str = "auto"
+    scheduled_time: datetime
     status: str = "pending"
     conflict_result: str = "none"
     conflict_detail: Optional[str] = ""

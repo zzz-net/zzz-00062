@@ -672,7 +672,10 @@ def create_scheduled_release(
                 result="replaced",
                 detail=f"候选被顶替(预约): 旧候选ID={change_log.old_candidate_id}, 新候选ID={change_log.new_candidate_id}",
             )
+        archive = crud.get_archive_by_scheduled_release_id(db, sched.id)
         return {
+            "id": sched.id,
+            "release_archive_id": archive.id if archive else None,
             "scheduled_release": schemas.ScheduledReleaseResponse.model_validate(sched).model_dump(),
             "candidate": schemas.ReleaseCandidateResponse.model_validate(candidate).model_dump(),
             "change_log": schemas.CandidateChangeLogResponse.model_validate(change_log).model_dump(),
@@ -1168,6 +1171,7 @@ def get_release_archive_detail(
         source_batch_id=archive.source_batch_id,
         target_version=archive.target_version,
         execution_strategy=archive.execution_strategy,
+        scheduled_time=archive.scheduled_time,
         status=archive.status,
         conflict_result=archive.conflict_result,
         conflict_detail=archive.conflict_detail,
@@ -1353,6 +1357,7 @@ def verify_archive_fields(
         "target_version": archive.target_version,
         "execution_strategy": archive.execution_strategy,
         "scheduled_release_id": archive.scheduled_release_id,
+        "scheduled_time": archive.scheduled_time.isoformat() if archive.scheduled_time else None,
     }
 
     for field, expected_value in req.expected_fields.items():
@@ -1477,3 +1482,70 @@ def get_archive_stats(
 ):
     stats = crud.get_archive_stats(db)
     return stats
+
+
+@app.post("/api/release-archives/{archive_id}/execute", response_model=dict)
+def manually_execute_archive(
+    archive_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_EXECUTE_ROLES)),
+):
+    archive = crud.get_archive_by_id(db, archive_id)
+    if not archive:
+        crud.write_audit_log(
+            db,
+            action="archive_manual_execute",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="not_found",
+            detail=f"手动接管执行失败: 档案不存在",
+        )
+        raise HTTPException(status_code=404, detail="档案不存在")
+
+    permission_ok, permission_msg = crud.check_archive_permission(
+        db, archive_id, user.username, auth.ALLOW_ARCHIVE_EXECUTE_ROLES, user.role, "execute"
+    )
+    if not permission_ok:
+        crud.write_audit_log(
+            db,
+            action="archive_manual_execute",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="forbidden",
+            detail=f"手动接管执行被拒: {permission_msg}",
+        )
+        raise HTTPException(status_code=403, detail=permission_msg)
+
+    terminal_statuses = {models.ARCHIVE_STATUS_EXECUTED, models.ARCHIVE_STATUS_CANCELLED,
+                         models.ARCHIVE_STATUS_SUPERSEDED, models.ARCHIVE_STATUS_FAILED}
+    if archive.status in terminal_statuses:
+        crud.write_audit_log(
+            db,
+            action="archive_manual_execute",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="rejected",
+            detail=f"手动接管执行被拒: 已处于终态{archive.status}",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"档案已处于终态{archive.status}，不能手动接管执行（仅pending/executing状态可执行）"
+        )
+
+    try:
+        result = crud.manually_execute_archive(db, archive_id, user.username)
+        return result
+    except ValueError as e:
+        crud.write_audit_log(
+            db,
+            action="archive_manual_execute",
+            operator=user.username,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="rejected",
+            detail=f"手动接管执行被拒: {str(e)}",
+        )
+        raise HTTPException(status_code=400, detail=str(e))

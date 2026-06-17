@@ -290,6 +290,7 @@ class ReleaseArchive(Base):
     source_batch_id = Column(Integer, nullable=False, index=True)
     target_version = Column(String(50), nullable=True)
     execution_strategy = Column(String(20), nullable=False, default=ARCHIVE_EXEC_STRATEGY_AUTO)
+    scheduled_time = Column(DateTime, nullable=False)
 
     snapshot_hash = Column(String(64), nullable=False, index=True)
     status = Column(String(20), nullable=False, default=ARCHIVE_STATUS_PENDING, index=True)

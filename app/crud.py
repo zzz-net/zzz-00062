@@ -266,7 +266,8 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
     if db_batch.status != "calculated":
         raise ValueError("批次尚未完成计算，不能预约发布")
 
-    if req.scheduled_time <= datetime.utcnow():
+    sched_time_norm = parse_and_normalize_datetime(req.scheduled_time)
+    if sched_time_norm <= datetime.utcnow():
         raise ValueError("预约生效时间必须晚于当前时间")
 
     old_candidate = get_current_candidate(db)
@@ -352,6 +353,9 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
         pass
 
     try:
+        exec_strategy = req.execution_strategy or "auto"
+        if exec_strategy not in models.VALID_ARCHIVE_EXEC_STRATEGIES:
+            raise ValueError(f"无效执行策略: {exec_strategy}。允许值: {', '.join(sorted(models.VALID_ARCHIVE_EXEC_STRATEGIES))}")
         archive = create_release_archive(
             db,
             scheduled_release_id=sched.id,
@@ -359,8 +363,10 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
             approval_remark=req.approval_remark or req.operation_remark or "",
             triggered_by=req.set_by,
             source_batch_id=req.batch_id,
+            scheduled_time=req.scheduled_time,
             release_plan_id=plan_result[0].id if plan_result else None,
-            execution_strategy="auto",
+            target_version=req.target_version,
+            execution_strategy=exec_strategy,
         )
         _append_processing_log(db, archive, "created_with_scheduled", req.set_by,
                                f"随预约发布创建档案，预约ID={sched.id}")
@@ -1846,12 +1852,39 @@ import hashlib
 import json
 
 
+def normalize_datetime_for_snapshot(dt: datetime) -> str:
+    if dt.tzinfo is not None:
+        from datetime import timezone
+        utc_dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return utc_dt.isoformat() + "+00:00"
+    else:
+        return dt.isoformat() + "+00:00"
+
+
+def parse_and_normalize_datetime(dt_input: datetime | str) -> datetime:
+    if isinstance(dt_input, datetime):
+        dt = dt_input
+    else:
+        try:
+            dt = datetime.fromisoformat(dt_input)
+        except (ValueError, TypeError):
+            try:
+                dt = datetime.fromisoformat(dt_input.replace("Z", "+00:00"))
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"无效的时间格式: {dt_input}") from e
+    if dt.tzinfo is not None:
+        from datetime import timezone
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def calculate_snapshot_hash(
     release_note: str,
     approval_remark: str,
     triggered_by: str,
     source_batch_id: int,
     scheduled_release_id: int,
+    scheduled_time: datetime,
     target_version: str | None = None,
     execution_strategy: str = "auto",
 ) -> str:
@@ -1863,6 +1896,7 @@ def calculate_snapshot_hash(
         "target_version": target_version,
         "execution_strategy": execution_strategy,
         "scheduled_release_id": scheduled_release_id,
+        "scheduled_time": normalize_datetime_for_snapshot(scheduled_time),
     }
     snapshot_str = json.dumps(snapshot_data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(snapshot_str.encode("utf-8")).hexdigest()
@@ -1875,6 +1909,7 @@ def create_release_archive(
     approval_remark: str,
     triggered_by: str,
     source_batch_id: int,
+    scheduled_time: datetime,
     release_plan_id: int | None = None,
     target_version: str | None = None,
     execution_strategy: str = "auto",
@@ -1885,12 +1920,15 @@ def create_release_archive(
                                f"幂等跳过: 预约{scheduled_release_id}的档案已存在(archive_id={existing.id})")
         return existing
 
+    normalized_scheduled_time = parse_and_normalize_datetime(scheduled_time)
+
     snapshot_hash = calculate_snapshot_hash(
         release_note=release_note,
         approval_remark=approval_remark,
         triggered_by=triggered_by,
         source_batch_id=source_batch_id,
         scheduled_release_id=scheduled_release_id,
+        scheduled_time=normalized_scheduled_time,
         target_version=target_version,
         execution_strategy=execution_strategy,
     )
@@ -1905,6 +1943,7 @@ def create_release_archive(
         source_batch_id=source_batch_id,
         target_version=target_version,
         execution_strategy=execution_strategy,
+        scheduled_time=normalized_scheduled_time,
         snapshot_hash=snapshot_hash,
         status=models.ARCHIVE_STATUS_PENDING,
         conflict_result=models.ARCHIVE_CONFLICT_NONE,
@@ -2108,6 +2147,7 @@ def verify_archive_snapshot(
         triggered_by=archive.triggered_by,
         source_batch_id=archive.source_batch_id,
         scheduled_release_id=archive.scheduled_release_id,
+        scheduled_time=archive.scheduled_time,
         target_version=archive.target_version,
         execution_strategy=archive.execution_strategy,
     )
@@ -2140,6 +2180,7 @@ def export_archive(
         ("target_version", archive.target_version or "", "目标版本（快照）"),
         ("execution_strategy", archive.execution_strategy, "执行策略（快照）"),
         ("scheduled_release_id", str(archive.scheduled_release_id), "关联预约ID（快照）"),
+        ("scheduled_time", archive.scheduled_time.isoformat() + "+00:00" if archive.scheduled_time else "", "预约时间（快照UTC）"),
         ("is_immutable", str(archive.is_immutable), "是否不可变（快照）"),
     ]
 
@@ -2374,7 +2415,160 @@ def check_archive_permission(
         return False, f"权限不足，需要以下角色之一: {', '.join(required_roles)}，当前角色: {user_role}"
 
     if archive.triggered_by != username and user_role not in ["admin"]:
-        if operation in ["cancel", "audit"]:
+        if operation in ["cancel", "audit", "execute"]:
             return False, f"仅创建人或管理员可{operation}该档案"
 
     return True, ""
+
+
+def manually_execute_archive(
+    db: Session,
+    archive_id: int,
+    operator: str,
+) -> dict:
+    archive = get_archive_by_id(db, archive_id)
+    if not archive:
+        raise ValueError("档案不存在")
+
+    terminal_statuses = {models.ARCHIVE_STATUS_EXECUTED, models.ARCHIVE_STATUS_CANCELLED,
+                         models.ARCHIVE_STATUS_SUPERSEDED, models.ARCHIVE_STATUS_FAILED}
+    if archive.status in terminal_statuses:
+        raise ValueError(f"档案已处于终态{archive.status}，不能手动接管执行")
+
+    if not archive.scheduled_release_id:
+        raise ValueError("档案未关联预约记录，无法执行")
+
+    sched = get_scheduled_release(db, archive.scheduled_release_id)
+    if not sched:
+        raise ValueError(f"关联预约记录不存在，scheduled_release_id={archive.scheduled_release_id}")
+
+    if sched.status == "executed":
+        raise ValueError("预约已被执行，无法重复执行（幂等保护）")
+    if sched.status == "cancelled":
+        raise ValueError(f"预约已被取消（原因: {sched.cancel_reason}），无法执行")
+
+    if archive.execution_strategy == models.ARCHIVE_EXEC_STRATEGY_MANUAL:
+        pass
+    elif archive.execution_strategy == models.ARCHIVE_EXEC_STRATEGY_FORCE:
+        pass
+    else:
+        if sched.status != "pending":
+            raise ValueError(f"预约状态为{sched.status}，非pending状态仅force策略可强制执行")
+
+    candidate = db.query(models.ReleaseCandidate).filter(
+        models.ReleaseCandidate.id == sched.candidate_id
+    ).first()
+
+    if not candidate or not candidate.is_current:
+        if archive.execution_strategy != models.ARCHIVE_EXEC_STRATEGY_FORCE:
+            raise ValueError("候选已失效/被顶替/被取消，仅force策略可强制执行")
+
+    batch = get_batch(db, sched.batch_id)
+    if not batch:
+        raise ValueError("关联批次不存在")
+    if batch.status != "calculated" and batch.status != "released":
+        if archive.execution_strategy != models.ARCHIVE_EXEC_STRATEGY_FORCE:
+            raise ValueError(f"批次状态为{batch.status}，仅force策略可强制执行")
+
+    update_archive_status(
+        db, archive_id, models.ARCHIVE_STATUS_EXECUTING, operator,
+        conflict_result=models.ARCHIVE_CONFLICT_NONE,
+        conflict_detail=f"手动接管执行触发，策略={archive.execution_strategy}",
+    )
+    _append_processing_log(db, archive, "manual_takeover_start", operator,
+                           f"手动接管开始执行，策略={archive.execution_strategy}，"
+                           f"原预约状态={sched.status}")
+
+    try:
+        approve_data = schemas.ApproveRequest(
+            approved_by=archive.triggered_by or operator,
+            approval_remark=archive.approval_remark or f"手动接管执行(快照)，原预约时间 {archive.scheduled_time.isoformat() if archive.scheduled_time else ''}",
+            release_note=archive.release_note or f"手动接管生效发布(快照)",
+        )
+        release = approve_and_release(
+            db,
+            sched.batch_id,
+            approve_data,
+            release_source="manual_takeover",
+            scheduled_release_id=sched.id,
+        )
+
+        update_archive_status(
+            db, archive_id, models.ARCHIVE_STATUS_EXECUTED, operator,
+            conflict_result=models.ARCHIVE_CONFLICT_NONE,
+            conflict_detail=f"手动接管执行成功，版本={release.version}",
+            release_version_id=release.id,
+        )
+        _add_archive_reference(db, archive_id, "release_version", str(release.id),
+                               "archive_manual_executed", operator,
+                               f"手动接管执行成功，版本={release.version}")
+        _append_processing_log(db, archive, "manual_takeover_success", operator,
+                               f"手动接管执行完成，版本ID={release.id}，版本号={release.version}")
+
+        write_audit_log(
+            db,
+            action="archive_manual_execute",
+            operator=operator,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="success",
+            detail=f"手动接管执行档案成功，版本={release.version}，策略={archive.execution_strategy}",
+        )
+
+        return {
+            "archive_id": archive_id,
+            "status": models.ARCHIVE_STATUS_EXECUTED,
+            "release_version": release.version,
+            "release_version_id": release.id,
+            "executed_by": operator,
+            "from_snapshot": True,
+        }
+    except ValueError as e:
+        if "已发布过" in str(e):
+            existing_release = db.query(models.ReleaseVersion).filter(
+                models.ReleaseVersion.batch_id == sched.batch_id
+            ).first()
+            if existing_release:
+                update_archive_status(
+                    db, archive_id, models.ARCHIVE_STATUS_EXECUTED, operator,
+                    conflict_result=models.ARCHIVE_CONFLICT_NONE,
+                    conflict_detail=f"幂等检测：批次已发布，版本={existing_release.version}",
+                    release_version_id=existing_release.id,
+                )
+                _append_processing_log(db, archive, "manual_takeover_idempotent_aligned", operator,
+                                       f"幂等对齐：批次已发布(版本={existing_release.version})，视作执行成功")
+                write_audit_log(
+                    db,
+                    action="archive_manual_execute",
+                    operator=operator,
+                    target_type="release_archive",
+                    target_id=str(archive_id),
+                    result="idempotent_success",
+                    detail=f"手动接管幂等对齐：批次已发布，版本={existing_release.version}",
+                )
+                return {
+                    "archive_id": archive_id,
+                    "status": models.ARCHIVE_STATUS_EXECUTED,
+                    "release_version": existing_release.version,
+                    "release_version_id": existing_release.id,
+                    "executed_by": operator,
+                    "from_snapshot": True,
+                    "idempotent_aligned": True,
+                }
+        update_archive_status(
+            db, archive_id, models.ARCHIVE_STATUS_FAILED, operator,
+            conflict_result=models.ARCHIVE_CONFLICT_NONE,
+            conflict_detail=f"手动接管执行失败: {str(e)}",
+        )
+        _append_processing_log(db, archive, "manual_takeover_failed", operator,
+                               f"手动接管执行失败: {str(e)}")
+        write_audit_log(
+            db,
+            action="archive_manual_execute",
+            operator=operator,
+            target_type="release_archive",
+            target_id=str(archive_id),
+            result="failed",
+            detail=f"手动接管执行失败: {str(e)}",
+        )
+        raise

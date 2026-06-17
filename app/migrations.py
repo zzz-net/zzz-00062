@@ -8,7 +8,7 @@ from . import models
 logger = logging.getLogger("release_plan_migrations")
 
 MIGRATION_VERSION_TABLE = "_schema_migrations"
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 def ensure_migration_table(db: Session):
@@ -588,6 +588,12 @@ def backfill_release_archives(db: Session):
         """), {"srid": sr_id}).fetchone()
         plan_id = plan[0] if plan else None
 
+        stime_for_hash = sr[4]
+        try:
+            stime_iso_hash = stime_for_hash.isoformat() if hasattr(stime_for_hash, 'isoformat') else str(stime_for_hash)
+        except Exception:
+            stime_iso_hash = str(stime_for_hash) if stime_for_hash else ""
+        stime_norm_hash = stime_iso_hash + ("" if "+" in stime_iso_hash or "Z" in stime_iso_hash else "+00:00")
         snapshot_data = {
             "release_note": change_desc,
             "approval_remark": op_remark,
@@ -596,6 +602,7 @@ def backfill_release_archives(db: Session):
             "target_version": None,
             "execution_strategy": "auto",
             "scheduled_release_id": sr_id,
+            "scheduled_time": stime_norm_hash,
         }
         snapshot_str = json.dumps(snapshot_data, sort_keys=True, ensure_ascii=False)
         snapshot_hash = hashlib.sha256(snapshot_str.encode("utf-8")).hexdigest()
@@ -614,14 +621,14 @@ def backfill_release_archives(db: Session):
             INSERT INTO release_archives (
                 id, scheduled_release_id, release_plan_id, release_version_id,
                 release_note, approval_remark, triggered_by, source_batch_id,
-                target_version, execution_strategy, snapshot_hash, status,
+                target_version, execution_strategy, scheduled_time, snapshot_hash, status,
                 conflict_result, conflict_detail, is_immutable,
                 created_at, archived_at, last_processed_at,
                 recovered_after_restart, processing_log, reference_count
             ) VALUES (
                 :id, :srid, :plan_id, :version_id,
                 :note, :remark, :triggered_by, :batch_id,
-                :target_ver, :exec_strategy, :hash, :status,
+                :target_ver, :exec_strategy, :sched_time, :hash, :status,
                 :conflict, :conflict_detail, 1,
                 :created, :archived, :last_processed,
                 0, '[]', 0
@@ -637,6 +644,7 @@ def backfill_release_archives(db: Session):
             "batch_id": batch_id,
             "target_ver": None,
             "exec_strategy": "auto",
+            "sched_time": sr[4],
             "hash": snapshot_hash,
             "status": archive_status,
             "conflict": "none",
@@ -666,6 +674,74 @@ def backfill_release_archives(db: Session):
     logger.info(f"Backfilled {len(sched_releases)} release archives")
 
 
+def migrate_v4_to_v5(db: Session):
+    logger.info("Starting migration v4 -> v5: Add scheduled_time to release_archives for immutable time snapshot")
+
+    if table_exists(db, "release_archives") and not column_exists(db, "release_archives", "scheduled_time"):
+        db.execute(text("ALTER TABLE release_archives ADD COLUMN scheduled_time DATETIME"))
+        logger.info("Added scheduled_time column to release_archives")
+
+        sched_archives = db.execute(text("""
+            SELECT ra.id, ra.scheduled_release_id, sr.scheduled_time
+            FROM release_archives ra
+            LEFT JOIN scheduled_releases sr ON ra.scheduled_release_id = sr.id
+            WHERE ra.scheduled_time IS NULL
+        """)).fetchall()
+
+        updated_count = 0
+        for aid, srid, stime in sched_archives:
+            if stime:
+                db.execute(text("""
+                    UPDATE release_archives SET scheduled_time = :st WHERE id = :id
+                """), {"st": stime, "id": aid})
+                updated_count += 1
+        logger.info(f"Backfilled scheduled_time for {updated_count} archives")
+        db.commit()
+
+    import hashlib
+    import json
+    archives_to_rehash = db.execute(text("""
+        SELECT id, scheduled_release_id, release_note, approval_remark,
+               triggered_by, source_batch_id, target_version,
+               execution_strategy, scheduled_time
+        FROM release_archives
+        WHERE scheduled_time IS NOT NULL
+    """)).fetchall()
+
+    rehashed = 0
+    for row in archives_to_rehash:
+        aid, srid, note, remark, trig, batch, tver, estr, stime = row
+        try:
+            stime_iso = stime.isoformat() if hasattr(stime, 'isoformat') else str(stime)
+        except Exception:
+            stime_iso = str(stime) if stime else ""
+        stime_norm = stime_iso + ("" if "+" in stime_iso or "Z" in stime_iso else "+00:00")
+        snapshot = {
+            "release_note": note or "",
+            "approval_remark": remark or "",
+            "triggered_by": trig or "",
+            "source_batch_id": batch,
+            "target_version": tver,
+            "execution_strategy": estr or "auto",
+            "scheduled_release_id": srid,
+            "scheduled_time": stime_norm,
+        }
+        new_hash = hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        db.execute(text("""
+            UPDATE release_archives SET snapshot_hash = :hash WHERE id = :id
+        """), {"hash": new_hash, "id": aid})
+        rehashed += 1
+
+    if rehashed > 0:
+        db.commit()
+        logger.info(f"Rehashed snapshots with scheduled_time for {rehashed} archives")
+
+    record_migration(db, 5, "Add scheduled_time column + rehash archive snapshots for full time immutability")
+    logger.info("Migration v4->v5 completed successfully")
+
+
 def run_migrations(db: Session):
     current = get_current_version(db)
     logger.info(f"Current schema version: {current}, target: {CURRENT_SCHEMA_VERSION}")
@@ -685,6 +761,10 @@ def run_migrations(db: Session):
     if current < 4:
         migrate_v3_to_v4(db)
         current = 4
+
+    if current < 5:
+        migrate_v4_to_v5(db)
+        current = 5
 
     try:
         repair_bad_plan_data(db)
