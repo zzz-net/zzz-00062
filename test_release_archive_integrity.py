@@ -271,7 +271,7 @@ def main():
 
             check("导出包含8个快照字段", len(snapshot_items) == 8,
                   f"actual snapshot fields: {[i['field'] for i in snapshot_items]}")
-            check("导出包含9个运行时字段", len(runtime_items) == 9,
+            check("导出包含10个运行时字段", len(runtime_items) == 10,
                   f"actual runtime fields: {[i['field'] for i in runtime_items]}")
 
             field_values = {item["field"]: item["value"] for item in items}

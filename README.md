@@ -62,9 +62,10 @@
 
 ### 7. 导出一致性
 `/api/release-archives/{id}/export` 返回结果中：
-- `is_snapshot=True` 的 9 个字段（含 `scheduled_time`、`target_version`、`execution_strategy`）**严格等于创建时快照**
+- `is_snapshot=True` 的 8 个字段（含 `scheduled_time`、`target_version`、`execution_strategy`）**严格等于创建时快照**
 - `snapshot_hash` 与档案主记录一致，可独立校验
 - 导出后 `reference_count` +1 并写入引用记录
+- `processing_log` 包含完整的状态流转和处理日志（含创建、恢复、取消等事件），与详情接口一致
 
 ### 8. 手动接管（Manual Takeover）
 接口：`POST /api/release-archives/{archive_id}/execute`
@@ -75,6 +76,21 @@
   - `manual`：放宽候选有效性校验
   - `force`：无视候选状态、批次状态，强制触发发布
 - 执行后版本号、状态、处理日志全部落库并可审计
+
+### 9. 导入冲突识别
+接口：`GET /api/release-archives/check-conflict/import?rule_id=&new_batch_id=&imported_by=`
+
+- 导入同规则新批次前，可预检是否存在待执行的档案冲突
+- 返回受影响档案的ID、快照哈希、目标版本、执行策略等关键信息
+- 实际导入时，冲突档案会被自动标记为 `superseded`（冲突结果=`import_conflict`）
+
+### 10. 时间格式容错
+`scheduled_time` 字段同时接受以下输入格式，不会因格式差异返回 500：
+- ISO 8601 带时区：`2025-06-18T10:00:00+08:00`
+- ISO 8601 Z 后缀：`2025-06-18T02:00:00Z`
+- ISO 8601 不带时区（视为 UTC）：`2025-06-18T02:00:00`
+- 空格分隔格式：`2025-06-18 02:00:00`
+- 无效格式返回 400（含明确错误提示），绝不返回 500
 
 ---
 

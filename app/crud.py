@@ -2181,7 +2181,6 @@ def export_archive(
         ("execution_strategy", archive.execution_strategy, "执行策略（快照）"),
         ("scheduled_release_id", str(archive.scheduled_release_id), "关联预约ID（快照）"),
         ("scheduled_time", archive.scheduled_time.isoformat() + "+00:00" if archive.scheduled_time else "", "预约时间（快照UTC）"),
-        ("is_immutable", str(archive.is_immutable), "是否不可变（快照）"),
     ]
 
     runtime_fields = [
@@ -2189,6 +2188,7 @@ def export_archive(
         ("conflict_result", archive.conflict_result, "冲突结果"),
         ("conflict_detail", archive.conflict_detail, "冲突详情"),
         ("snapshot_hash", archive.snapshot_hash, "快照哈希"),
+        ("is_immutable", str(archive.is_immutable), "是否不可变"),
         ("created_at", archive.created_at.isoformat() if archive.created_at else "", "创建时间"),
         ("archived_at", archive.archived_at.isoformat() if archive.archived_at else "", "归档时间"),
         ("last_processed_at", archive.last_processed_at.isoformat() if archive.last_processed_at else "", "最后处理时间"),
