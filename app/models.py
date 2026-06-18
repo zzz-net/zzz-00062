@@ -297,6 +297,8 @@ class ReleaseArchive(Base):
     conflict_result = Column(String(30), nullable=False, default=ARCHIVE_CONFLICT_NONE)
     conflict_detail = Column(Text, default="")
 
+    context_snapshot = Column(JSON, nullable=False, default={})
+
     is_immutable = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     archived_at = Column(DateTime, default=datetime.utcnow, index=True)

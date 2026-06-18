@@ -367,6 +367,8 @@ def create_scheduled_release(db: Session, req: schemas.ScheduleReleaseRequest):
             release_plan_id=plan_result[0].id if plan_result else None,
             target_version=req.target_version,
             execution_strategy=exec_strategy,
+            rule_id=db_batch.rule_id,
+            candidate_id=new_candidate.id,
         )
         _append_processing_log(db, archive, "created_with_scheduled", req.set_by,
                                f"随预约发布创建档案，预约ID={sched.id}")
@@ -1887,7 +1889,9 @@ def calculate_snapshot_hash(
     scheduled_time: datetime,
     target_version: str | None = None,
     execution_strategy: str = "auto",
+    context_snapshot: dict | None = None,
 ) -> str:
+    context_for_hash = context_snapshot if context_snapshot is not None else {}
     snapshot_data = {
         "release_note": release_note,
         "approval_remark": approval_remark,
@@ -1897,9 +1901,67 @@ def calculate_snapshot_hash(
         "execution_strategy": execution_strategy,
         "scheduled_release_id": scheduled_release_id,
         "scheduled_time": normalize_datetime_for_snapshot(scheduled_time),
+        "context_snapshot": context_for_hash,
     }
     snapshot_str = json.dumps(snapshot_data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(snapshot_str.encode("utf-8")).hexdigest()
+
+
+def build_context_snapshot(
+    db: Session,
+    batch_id: int,
+    rule_id: int | None = None,
+    candidate_id: int | None = None,
+    scheduled_release_id: int | None = None,
+    release_plan_id: int | None = None,
+) -> dict:
+    ctx: dict = {"locked_at": datetime.utcnow().isoformat()}
+    try:
+        batch = get_batch(db, batch_id)
+        if batch:
+            ctx["batch"] = {
+                "id": batch.id,
+                "batch_name": batch.batch_name,
+                "status": batch.status,
+                "imported_by": batch.imported_by,
+                "supplier_count": batch.supplier_count,
+            }
+        if rule_id:
+            rule = get_rule(db, rule_id)
+            if rule:
+                ctx["rule"] = {
+                    "id": rule.id,
+                    "name": rule.name,
+                    "is_active": rule.is_active,
+                }
+        if candidate_id:
+            cand = db.query(models.ReleaseCandidate).filter(models.ReleaseCandidate.id == candidate_id).first()
+            if cand:
+                ctx["candidate"] = {
+                    "id": cand.id,
+                    "change_description": cand.change_description,
+                    "operation_remark": cand.operation_remark,
+                    "set_by": cand.set_by,
+                    "is_current": cand.is_current,
+                }
+        if scheduled_release_id:
+            sched = db.query(models.ScheduledRelease).filter(models.ScheduledRelease.id == scheduled_release_id).first()
+            if sched:
+                ctx["scheduled_release"] = {
+                    "id": sched.id,
+                    "status": sched.status,
+                    "created_by": sched.created_by,
+                }
+        active_release = get_active_release(db)
+        if active_release:
+            ctx["active_release_at_create"] = {
+                "id": active_release.id,
+                "version": active_release.version,
+                "batch_id": active_release.batch_id,
+            }
+    except Exception as e:
+        ctx["build_context_error"] = str(e)
+    return ctx
 
 
 def create_release_archive(
@@ -1913,6 +1975,9 @@ def create_release_archive(
     release_plan_id: int | None = None,
     target_version: str | None = None,
     execution_strategy: str = "auto",
+    context_snapshot: dict | None = None,
+    rule_id: int | None = None,
+    candidate_id: int | None = None,
 ) -> models.ReleaseArchive:
     existing = get_archive_by_scheduled_release_id(db, scheduled_release_id)
     if existing:
@@ -1921,6 +1986,16 @@ def create_release_archive(
         return existing
 
     normalized_scheduled_time = parse_and_normalize_datetime(scheduled_time)
+
+    if context_snapshot is None:
+        context_snapshot = build_context_snapshot(
+            db,
+            batch_id=source_batch_id,
+            rule_id=rule_id,
+            candidate_id=candidate_id,
+            scheduled_release_id=scheduled_release_id,
+            release_plan_id=release_plan_id,
+        )
 
     snapshot_hash = calculate_snapshot_hash(
         release_note=release_note,
@@ -1931,6 +2006,7 @@ def create_release_archive(
         scheduled_time=normalized_scheduled_time,
         target_version=target_version,
         execution_strategy=execution_strategy,
+        context_snapshot=context_snapshot,
     )
 
     now = datetime.utcnow()
@@ -1948,6 +2024,7 @@ def create_release_archive(
         status=models.ARCHIVE_STATUS_PENDING,
         conflict_result=models.ARCHIVE_CONFLICT_NONE,
         conflict_detail="",
+        context_snapshot=context_snapshot,
         is_immutable=True,
         created_at=now,
         archived_at=now,
@@ -1996,6 +2073,8 @@ def list_archives(
     triggered_by: str | None = None,
     skip: int = 0,
     limit: int = 100,
+    requesting_username: str | None = None,
+    requesting_user_role: str | None = None,
 ) -> list[models.ReleaseArchive]:
     q = db.query(models.ReleaseArchive)
     if scheduled_release_id is not None:
@@ -2012,6 +2091,8 @@ def list_archives(
         q = q.filter(models.ReleaseArchive.conflict_result == conflict_result)
     if triggered_by:
         q = q.filter(models.ReleaseArchive.triggered_by == triggered_by)
+    if requesting_username and requesting_user_role not in ["admin", "approver"]:
+        q = q.filter(models.ReleaseArchive.triggered_by == requesting_username)
     return q.order_by(models.ReleaseArchive.archived_at.desc()).offset(skip).limit(limit).all()
 
 
@@ -2150,6 +2231,7 @@ def verify_archive_snapshot(
         scheduled_time=archive.scheduled_time,
         target_version=archive.target_version,
         execution_strategy=archive.execution_strategy,
+        context_snapshot=archive.context_snapshot if isinstance(archive.context_snapshot, dict) else {},
     )
 
     verified = expected_hash == archive.snapshot_hash
@@ -2181,6 +2263,7 @@ def export_archive(
         ("execution_strategy", archive.execution_strategy, "执行策略（快照）"),
         ("scheduled_release_id", str(archive.scheduled_release_id), "关联预约ID（快照）"),
         ("scheduled_time", archive.scheduled_time.isoformat() + "+00:00" if archive.scheduled_time else "", "预约时间（快照UTC）"),
+        ("context_snapshot", json.dumps(archive.context_snapshot if isinstance(archive.context_snapshot, dict) else {}, ensure_ascii=False), "关键上下文（快照）"),
     ]
 
     runtime_fields = [
@@ -2416,7 +2499,7 @@ def check_archive_permission(
         return False, f"权限不足，需要以下角色之一: {', '.join(required_roles)}，当前角色: {user_role}"
 
     if archive.triggered_by != username and user_role not in ["admin"]:
-        if operation in ["cancel", "audit", "execute"]:
+        if operation in ["cancel", "audit", "execute", "view", "export"]:
             return False, f"仅创建人或管理员可{operation}该档案"
 
     return True, ""

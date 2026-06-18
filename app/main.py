@@ -6,6 +6,7 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import logging
+import json
 from .database import engine, Base, get_db, SessionLocal
 from . import models, schemas, crud, auth
 from .scheduler import scheduler
@@ -262,7 +263,7 @@ def get_batch_suppliers(
 def calculate_scores(
     batch_id: int,
     db: Session = Depends(get_db),
-    _=Depends(auth.require_role([auth.ROLE_ADMIN, auth.ROLE_APPROVER]))
+    _=Depends(auth.require_role(auth.ALLOW_CALCULATE_ROLES))
 ):
     batch = crud.get_batch(db, batch_id)
     if not batch:
@@ -1143,6 +1144,8 @@ def list_release_archives(
         triggered_by=triggered_by,
         skip=skip,
         limit=limit,
+        requesting_username=user.username,
+        requesting_user_role=user.role,
     )
     return archives
 
@@ -1211,6 +1214,7 @@ def get_release_archive_detail(
         status=archive.status,
         conflict_result=archive.conflict_result,
         conflict_detail=archive.conflict_detail,
+        context_snapshot=archive.context_snapshot if isinstance(archive.context_snapshot, dict) else {},
         snapshot_hash=archive.snapshot_hash,
         is_immutable=archive.is_immutable,
         created_at=archive.created_at,
@@ -1520,6 +1524,34 @@ def get_archive_stats(
 ):
     stats = crud.get_archive_stats(db)
     return stats
+
+
+@app.post("/api/release-archives/recover-on-restart", response_model=dict)
+def recover_archives_after_restart(
+    db: Session = Depends(get_db),
+    user=Depends(auth.require_role(auth.ALLOW_ARCHIVE_AUDIT_ROLES)),
+):
+    crud.write_audit_log(
+        db,
+        action="archive_recover_restart",
+        operator=user.username,
+        target_type="release_archive",
+        target_id="__all__",
+        result="started",
+        detail="触发服务重启后档案恢复流程",
+    )
+    result = crud.recover_archives_on_restart(db)
+    crud.write_audit_log(
+        db,
+        action="archive_recover_restart",
+        operator=user.username,
+        target_type="release_archive",
+        target_id="__all__",
+        result="success",
+        detail=f"档案恢复完成: {json.dumps(result, ensure_ascii=False)}",
+    )
+    db.commit()
+    return result
 
 
 @app.post("/api/release-archives/{archive_id}/execute", response_model=dict)

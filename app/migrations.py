@@ -8,7 +8,7 @@ from . import models
 logger = logging.getLogger("release_plan_migrations")
 
 MIGRATION_VERSION_TABLE = "_schema_migrations"
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def ensure_migration_table(db: Session):
@@ -742,6 +742,63 @@ def migrate_v4_to_v5(db: Session):
     logger.info("Migration v4->v5 completed successfully")
 
 
+def migrate_v5_to_v6(db: Session):
+    logger.info("Starting migration v5 -> v6: Adding context_snapshot column to release_archives")
+
+    if table_exists(db, "release_archives") and not column_exists(db, "release_archives", "context_snapshot"):
+        db.execute(text("ALTER TABLE release_archives ADD COLUMN context_snapshot JSON"))
+        logger.info("Added context_snapshot column to release_archives")
+
+        db.execute(text("""
+            UPDATE release_archives SET context_snapshot = '{}'
+            WHERE context_snapshot IS NULL OR context_snapshot = ''
+        """))
+        db.commit()
+
+        import hashlib
+        import json as _json
+        archives_to_rehash = db.execute(text("""
+            SELECT id, scheduled_release_id, release_note, approval_remark,
+                   triggered_by, source_batch_id, target_version,
+                   execution_strategy, scheduled_time
+            FROM release_archives
+        """)).fetchall()
+
+        rehashed = 0
+        for row in archives_to_rehash:
+            aid, srid, note, remark, trig, batch, tver, estr, stime = row
+            try:
+                stime_iso = stime.isoformat() if hasattr(stime, 'isoformat') else str(stime)
+            except Exception:
+                stime_iso = str(stime) if stime else ""
+            stime_norm = stime_iso + ("" if "+" in stime_iso or "Z" in stime_iso else "+00:00")
+            snapshot = {
+                "release_note": note or "",
+                "approval_remark": remark or "",
+                "triggered_by": trig or "",
+                "source_batch_id": batch,
+                "target_version": tver,
+                "execution_strategy": estr or "auto",
+                "scheduled_release_id": srid,
+                "scheduled_time": stime_norm,
+                "context_snapshot": {},
+            }
+            new_hash = hashlib.sha256(
+                _json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            db.execute(text("""
+                UPDATE release_archives SET snapshot_hash = :hash WHERE id = :id
+            """), {"hash": new_hash, "id": aid})
+            rehashed += 1
+
+        if rehashed > 0:
+            db.commit()
+            logger.info(f"Rehashed {rehashed} archive snapshots with context_snapshot field")
+
+    record_migration(db, 6, "Add context_snapshot column + rehash for complete archive ledger integrity")
+    logger.info("Migration v5->v6 completed successfully")
+
+
 def run_migrations(db: Session):
     current = get_current_version(db)
     logger.info(f"Current schema version: {current}, target: {CURRENT_SCHEMA_VERSION}")
@@ -765,6 +822,10 @@ def run_migrations(db: Session):
     if current < 5:
         migrate_v4_to_v5(db)
         current = 5
+
+    if current < 6:
+        migrate_v5_to_v6(db)
+        current = 6
 
     try:
         repair_bad_plan_data(db)

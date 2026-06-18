@@ -434,6 +434,7 @@ class ReleaseArchiveSnapshot(BaseModel):
     execution_strategy: str = "auto"
     scheduled_release_id: int
     scheduled_time: datetime
+    context_snapshot: Dict[str, Any] = {}
 
 
 class ReleaseArchiveBase(BaseModel):
@@ -450,6 +451,7 @@ class ReleaseArchiveBase(BaseModel):
     status: str = "pending"
     conflict_result: str = "none"
     conflict_detail: Optional[str] = ""
+    context_snapshot: Dict[str, Any] = {}
 
 
 class ReleaseArchiveResponse(ReleaseArchiveBase):
