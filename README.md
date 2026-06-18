@@ -62,7 +62,8 @@
 
 ### 7. 导出一致性
 `/api/release-archives/{id}/export` 返回结果中：
-- `is_snapshot=True` 的 8 个字段（含 `scheduled_time`、`target_version`、`execution_strategy`）**严格等于创建时快照**
+- `is_snapshot=True` 的 **9** 个字段（`release_note`、`approval_remark`、`triggered_by`、`source_batch_id`、`target_version`、`execution_strategy`、`scheduled_release_id`、`scheduled_time`、`context_snapshot`）**严格等于创建时快照**
+- 查询接口（列表 / 详情）的所有快照字段与导出快照字段**值完全对齐**，不存在详情显示A而导出显示B的漂移问题
 - `snapshot_hash` 与档案主记录一致，可独立校验
 - 导出后 `reference_count` +1 并写入引用记录
 - `processing_log` 包含完整的状态流转和处理日志（含创建、恢复、取消等事件），与详情接口一致
